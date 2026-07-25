@@ -1,5 +1,9 @@
 # routers
 
+[![Crates.io](https://img.shields.io/crates/v/routers-rs.svg)](https://crates.io/crates/routers-rs)
+[![Documentation](https://docs.rs/routers-rs/badge.svg)](https://docs.rs/routers-rs)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](./LICENSE-MIT)
+
 基于 [reactive_graph](https://crates.io/crates/reactive_graph) 的**响应式路由器**,为 [gpui](https://gpui.rs) 桌面应用而生。
 
 把「当前显示哪个面板」建模成一个 URL pathname(`/files`、`/user/123`…)作为**单一事实来源**,点击导航只是 `Router::navigate(cx, "/path")` 一下,路由器自动匹配、提取参数、渲染对应内容——声明式路由的 React Router 体验,原生桌面性能。
@@ -65,7 +69,7 @@ crate 名是 **`routers-rs`**(crates.io 上 `routers` 已被占用),lib 名仍�
 [dependencies]
 routers = { package = "routers-rs", git = "https://github.com/Cambridge1995/routers-rs" }
 # 或(crates.io 发布后):
-routers = { package = "routers-rs", version = "0.1" }
+routers = { package = "routers-rs", version = "0.1.0" }
 ```
 
 ## 使用教程

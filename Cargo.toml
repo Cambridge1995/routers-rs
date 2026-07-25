@@ -9,7 +9,7 @@ description = "基于 reactive_graph 的响应式路由器,为 gpui 桌面应用
 keywords = ["gpui", "router", "routing", "reactive", "desktop"]
 categories = ["gui"]
 readme = "README.md"
-# repository 待 GitHub 仓库创建后补充(crates.io 要求真实可访问的 URL)。
+repository = "https://github.com/Cambridge1995/routers-rs"
 
 [lib]
 # lib 名保持 routers:framework/demo 的 `use routers::...` 与 `routers = { package = ... }` 依赖写法不变。
