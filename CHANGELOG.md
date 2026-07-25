@@ -5,6 +5,14 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/),
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- `register_element` 支持**动态路由模式**(0.1.0 只能精确路径):动态段 `{id}`、通配段 `{*splat}`,matchit 语义且静态模式优先;一条 `/user/{id}` 注册即可覆盖所有 `/user/*`
+- `register_element` 隐含 `Router::register`:元素模式自动登记进路由模式表,动态路径的 `params()` 提取与 `is_active()` 判定无需重复注册
+- 叶子元素匹配引擎升级为独立缓存 Trie(注册时失效、首次渲染重建,渲染路径零重复构建)
+
 ## [0.1.0] - 2026-07-26
 
 首个版本。受 [gpui-router](https://github.com/justjavac/gpui-router) 启发,

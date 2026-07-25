@@ -646,6 +646,102 @@ fn test_register_same_path_overrides_factory() {
     assert_eq!(calls.borrow().as_slice(), &["new"]);
 }
 
+/// 动态模式叶子(0.2 起):register_element("/user/{id}") 一条覆盖所有 /user/*。
+#[test]
+fn test_outlet_dynamic_element_pattern() {
+    let mut cx = TestAppContext::single();
+    let calls: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+
+    Router::init_default();
+    let c = Rc::clone(&calls);
+    Router::register_element("/user/{id}", move |_w, _cx| {
+        c.borrow_mut().push("user_panel");
+        div().into_any_element()
+    });
+
+    cx.update(|cx| {
+        Router::navigate(cx, "/user/42");
+    });
+    // 隐含 register:params 自动填充,无需另行 Router::register。
+    assert_eq!(
+        Router::params().get("id").map(|v| v.as_ref()),
+        Some("42")
+    );
+    // is_active 用模式判定同样生效。
+    assert!(Router::is_active("/user/{id}"));
+
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let _el = Outlet.render(window, cx);
+    });
+    assert_eq!(calls.borrow().as_slice(), &["user_panel"]);
+}
+
+/// 静态模式优先于动态模式(matchit 内建优先级)。
+#[test]
+fn test_outlet_static_beats_dynamic() {
+    let mut cx = TestAppContext::single();
+    let calls: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+
+    Router::init_default();
+    let c = Rc::clone(&calls);
+    Router::register_element("/user/{id}", move |_w, _cx| {
+        c.borrow_mut().push("dynamic");
+        div().into_any_element()
+    });
+    let c = Rc::clone(&calls);
+    Router::register_element("/user/new", move |_w, _cx| {
+        c.borrow_mut().push("static");
+        div().into_any_element()
+    });
+
+    cx.update(|cx| {
+        Router::navigate(cx, "/user/new"); // 应命中静态,不是 {id}
+    });
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let _el = Outlet.render(window, cx);
+    });
+    assert_eq!(calls.borrow().as_slice(), &["static"]);
+
+    // 其他 id 仍走动态模式。
+    cx.update(|_window, cx| {
+        Router::navigate(cx, "/user/42");
+    });
+    cx.update(|window, cx| {
+        let _el = Outlet.render(window, cx);
+    });
+    assert_eq!(calls.borrow().as_slice(), &["static", "dynamic"]);
+}
+
+/// 通配模式叶子:/docs/{*path} 匹配多级路径。
+#[test]
+fn test_outlet_wildcard_element_pattern() {
+    let mut cx = TestAppContext::single();
+    let calls: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+
+    Router::init_default();
+    let c = Rc::clone(&calls);
+    Router::register_element("/docs/{*path}", move |_w, _cx| {
+        c.borrow_mut().push("docs_panel");
+        div().into_any_element()
+    });
+
+    cx.update(|cx| {
+        Router::navigate(cx, "/docs/guide/intro");
+    });
+    assert_eq!(
+        Router::params().get("path").map(|v| v.as_ref()),
+        Some("guide/intro")
+    );
+
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let _el = Outlet.render(window, cx);
+    });
+    assert_eq!(calls.borrow().as_slice(), &["docs_panel"]);
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // 8. 响应式通知链路说明
 // ════════════════════════════════════════════════════════════════════════

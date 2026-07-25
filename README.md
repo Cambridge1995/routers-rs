@@ -131,9 +131,12 @@ Router::can_go_forward();  // → false
 ### 4. Outlet:自动渲染当前路由内容
 
 ```rust
-// 每个路由注册一个内容工厂
+// 每个路由注册一个内容工厂;支持动态模式(matchit 语义,静态优先)
 Router::register_element("/files", |window, cx| FilesPanel::render(window, cx));
-Router::register_element("/user/42", |window, cx| UserPanel::render(window, cx));
+Router::register_element("/user/{id}", |window, cx| UserPanel::render(window, cx));
+// 一条动态注册覆盖所有 /user/*:
+// navigate("/user/42") → UserPanel,且 Router::params()["id"] == "42"
+// (元素模式隐含 register,无需另行 Router::register)
 
 // 视图 render 里一行接入,路由变化时 Outlet 自动渲染当前内容
 impl Render for MainView {

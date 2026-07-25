@@ -358,10 +358,10 @@ fn register_routes() {
     // ① 路由模式:静态 + 动态段(matchit 语义,供 params / is_active 使用)。
     Router::register("/files");
     Router::register("/search");
-    Router::register("/user/{id}");
     Router::register("/settings/profile");
     Router::register("/settings/account");
     Router::register("/admin/panel");
+    // 注:/user/{id} 无需显式 register——下方 register_element 隐含登记。
 
     // ② 内容元素:每个路由一个工厂。
     Router::register_element("/files", |_w, _cx| {
@@ -370,11 +370,14 @@ fn register_routes() {
     Router::register_element("/search", |_w, _cx| {
         panel("🔍 搜索面板", "路径 /search · 静态路由", 0xc9a0ff).into_any_element()
     });
-    Router::register_element("/user/42", |_w, _cx| {
-        panel("👤 用户面板", "路径 /user/42 · 命中模式 /user/{id}", 0x7fd4a0).into_any_element()
-    });
-    Router::register_element("/user/7", |_w, _cx| {
-        panel("👤 用户面板", "路径 /user/7 · 命中模式 /user/{id}", 0x7fd4a0).into_any_element()
+    // ★ 动态模式叶子(0.2 新能力):一条注册覆盖所有 /user/*,params 自动填充。
+    Router::register_element("/user/{id}", |_w, _cx| {
+        panel(
+            "👤 用户面板",
+            &format!("动态模式 /user/{{id}} · 当前 id = {}", Router::params().get("id").map(|v| v.as_ref()).unwrap_or("?")),
+            0x7fd4a0,
+        )
+        .into_any_element()
     });
     Router::register_element("/settings/profile", |_w, _cx| {
         panel("⚙ 档案设置", "路径 /settings/profile · 被 /settings 布局嵌套", 0xe8c97f)

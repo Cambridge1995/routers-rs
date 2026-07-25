@@ -74,7 +74,9 @@
 //! Router::init_with(MyBus);
 //! ```
 
-use gpui::{AnyElement, App, Empty, IntoElement, RenderOnce, SharedString, Window};
+use crate::event_bus::{NoopEventBus, RouterEventBus};
+use crate::matching::{build_matchit, is_active_simple, is_prefix_of};
+use gpui::{AnyElement, App, Empty, IntoElement, SharedString, Window};
 use reactive_graph::owner::{LocalStorage, Owner};
 use reactive_graph::prelude::*; // 引入 Get/Set 等 trait 方法
 use reactive_graph::signal::RwSignal;
@@ -82,7 +84,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::OnceLock;
-
 // ════════════════════════════════════════════════════════════════════════
 // Outlet 相关类型别名
 // ════════════════════════════════════════════════════════════════════════
@@ -97,116 +98,6 @@ type ElementFactory = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
 ///
 /// 用 `Rc` 同理。使用方决定"子内容放在父布局的哪个位置"。
 type LayoutFactory = Rc<dyn Fn(AnyElement) -> AnyElement>;
-
-// ════════════════════════════════════════════════════════════════════════
-// EventBus trait 抽象(方案 C:使用方实现)
-// ════════════════════════════════════════════════════════════════════════
-
-/// Router 依赖的事件总线抽象(使用方实现)。
-///
-/// Router 在 [`Router::navigate`] / [`Router::back`] / [`Router::forward`] 时调用
-/// [`RouterEventBus::publish_route_changed`],让使用方决定如何通知订阅者
-/// (如转发到自己的 EventBus、gpui 原生 emit 等)。
-///
-/// 默认实现 [`NoopEventBus`] 丢弃所有事件——让 Router 不注入任何 bus 也能独立运行。
-/// framework 提供基于其 EventBus 的实现;其他 gpui 应用可自定义。
-///
-/// ## 为什么用 trait 而非回调
-///
-/// - **可读性**:`impl RouterEventBus for MyBus` 比 `set_on_change(|cx, path| ...)`
-///   更直白,新手一眼看懂。
-/// - **类型安全**:trait 方法签名明确,避免闭包签名写错。
-/// - **可扩展**:未来加新事件(如 `publish_route_will_change`),trait 加方法即可。
-/// - **可测试**:trait 易 mock。
-///
-/// ## 性能
-///
-/// trait object(`Box<dyn RouterEventBus>`)动态分发单次开销 ~1ns,
-/// navigate 非热路径(用户点击触发),性能与回调方案完全一致。
-pub trait RouterEventBus: 'static {
-    /// 发布路由变化事件(navigate/back/forward 时调用)。
-    ///
-    /// `cx` 让使用方能把事件转发到 gpui 全局状态(如 framework EventBus)。
-    fn publish_route_changed(&self, cx: &mut App, path: SharedString);
-
-    /// **路由守卫**:navigate/back/forward **之前**调用,判定是否允许导航。
-    ///
-    /// 返回值语义:
-    /// - `Ok(true)` —— 放行,导航继续执行。
-    /// - `Ok(false)` —— 静默取消(普通业务拒绝,如"未保存修改")。
-    /// - `Err(msg)` —— 带错误信息取消(如"权限不足:需要登录"),msg 会 eprintln。
-    ///
-    /// **默认实现** `Ok(true)` —— 不覆盖 = 无守卫,所有导航放行。
-    /// 现有 `NoopEventBus` / `FrameworkEventBus` 自动继承,**无需修改**。
-    ///
-    /// ## 使用方覆盖示例
-    ///
-    /// ### 场景 1:权限检查
-    /// ```ignore
-    /// fn allow_navigate(&self, _cx: &mut App, _from: SharedString, to: SharedString)
-    ///     -> Result<bool, SharedString> {
-    ///     if to.starts_with("/admin") && !is_logged_in() {
-    ///         return Err("需要登录".into());
-    ///     }
-    ///     Ok(true)
-    /// }
-    /// ```
-    ///
-    /// ### 场景 2:未保存修改提示弹框
-    /// ```ignore
-    /// fn allow_navigate(&self, cx: &mut App, _from: SharedString, _to: SharedString)
-    ///     -> Result<bool, SharedString> {
-    ///     let dirty = SharedStates::global(cx).get::<EditorState>("editor").unwrap().read(cx).dirty;
-    ///     if dirty { Ok(false) } else { Ok(true) }
-    /// }
-    /// // 调用侧:
-    /// if !Router::navigate(cx, "/other") {
-    ///     show_confirm_dialog("有未保存的修改,是否离开?",
-    ///         on_yes: |cx| Router::navigate_force(cx, "/other"));
-    /// }
-    /// ```
-    ///
-    /// ## ⚠️ 重要:守卫内禁止调 Router::navigate/back/forward(会死循环)。
-    /// 守卫只负责**判定**(返回 bool),不负责**执行**导航。
-    fn allow_navigate(
-        &self,
-        _cx: &mut App,
-        _from: SharedString,
-        _to: SharedString,
-    ) -> Result<bool, SharedString> {
-        Ok(true)
-    }
-
-    /// **持久化钩子**:navigate/back/forward **成功后**调用(在
-    /// [`publish_route_changed`](Self::publish_route_changed) 之后)。
-    ///
-    /// 使用方在此把 path 写盘(或写内存/数据库——routers 不关心存储介质,
-    /// 本体保持零磁盘依赖)。navigate 是低频用户操作(点击触发),写盘开销可忽略。
-    ///
-    /// **默认实现** no-op —— 不覆盖 = 不持久化,`NoopEventBus` 自动继承,**无需修改**。
-    fn persist_pathname(&self, _cx: &mut App, _path: &SharedString) {}
-
-    /// **恢复钩子**:[`Router::restore`] 时调用,返回上次持久化的 pathname。
-    ///
-    /// 返回 `None` = 无持久化记录(或读取失败),Router 保持默认 `"/"`。
-    ///
-    /// **默认实现** `None` —— 不覆盖 = 不恢复,`NoopEventBus` 自动继承,**无需修改**。
-    fn restore_pathname(&self, _cx: &App) -> Option<SharedString> {
-        None
-    }
-}
-
-/// 默认实现:丢弃所有事件。
-///
-/// 让 Router 独立可用——使用方不实现 [`RouterEventBus`] 也能跑(只是没人收到通知)。
-/// 适合独立项目(不需要事件通知)或测试场景。
-pub struct NoopEventBus;
-impl RouterEventBus for NoopEventBus {
-    fn publish_route_changed(&self, _cx: &mut App, _path: SharedString) {
-        // 故意空实现:丢弃事件。
-    }
-}
-
 // ════════════════════════════════════════════════════════════════════════
 // Router 核心
 // ════════════════════════════════════════════════════════════════════════
@@ -245,8 +136,13 @@ pub struct Router {
     params: RefCell<HashMap<SharedString, SharedString>>,
     /// 父布局注册表:(路径前缀, 工厂)。Outlet 渲染时按最长前缀匹配逐层包裹。
     layouts: RefCell<Vec<(SharedString, LayoutFactory)>>,
-    /// 叶子元素注册表:(精确路径, 工厂)。Outlet 渲染时找最具体的匹配。
+    /// 叶子元素注册表:(路由模式, 工厂)。Outlet 渲染时经 matchit 匹配
+    /// (支持动态段 `{id}` / 通配段 `{*splat}`,静态模式优先于动态模式)。
+    /// 下标稳定(只增不删),供 `elements_trie` 的 value 引用。
     elements: RefCell<Vec<(SharedString, ElementFactory)>>,
+    /// 叶子元素的 matchit Trie 缓存:value 是 `elements` 的下标。
+    /// register_element 时失效,首次渲染时重建。
+    elements_trie: RefCell<Option<matchit::Router<usize>>>,
 }
 
 // 全局 Router 实例(单窗口模型;多窗口需求出现时再升级为 SyncStorage + 全局 Owner)。
@@ -282,6 +178,7 @@ impl Router {
                     params: RefCell::new(HashMap::new()),
                     layouts: RefCell::new(Vec::new()),
                     elements: RefCell::new(Vec::new()),
+                    elements_trie: RefCell::new(None),
                 }
             });
         });
@@ -394,15 +291,22 @@ impl Router {
         });
     }
 
-    /// 注册**叶子元素**:某具体路径对应的内容工厂。
+    /// 注册**叶子元素**:某路由模式对应的内容工厂。
     ///
-    /// Outlet 渲染时,若当前路径**精确匹配**此注册,调用工厂生成元素。
+    /// Outlet 渲染时,用 matchit 对当前路径做模式匹配,命中即调用工厂生成元素。
     /// 用于"每个路由对应一个面板"场景。
     ///
+    /// **支持动态模式**(0.2 起):与 [`Router::register`] 相同的 matchit 语义——
+    /// 静态段、动态段 `{id}`、通配段 `{*splat}`,静态模式优先于动态模式:
+    ///
     /// ```ignore
-    /// Router::register_element("/files", |window, cx| FilesPanel::render(window, cx));
-    /// Router::register_element("/search", |window, cx| SearchPanel::render(window, cx));
+    /// Router::register_element("/files", |w, cx| FilesPanel::render(w, cx));
+    /// Router::register_element("/user/{id}", |w, cx| UserPanel::render(w, cx));
+    /// // navigate("/user/42") → UserPanel,且 Router::params()["id"] == "42"
     /// ```
+    ///
+    /// **隐含 [`Router::register`]**:元素模式同时登记进路由模式表,
+    /// 动态路径的 params 提取、[`Router::is_active`] 判定自动生效,无需重复注册。
     ///
     /// 工厂签名 `Fn(&mut Window, &mut App) -> AnyElement`——接收 window + cx
     /// 因为面板通常需要它们构造(Entity/焦点等)。
@@ -414,11 +318,21 @@ impl Router {
             if let Some(router) = slot.get() {
                 let path = path.into();
                 let mut elements = router.elements.borrow_mut();
-                // 去重:同路径覆盖旧工厂。
+                // 去重:同模式覆盖旧工厂。
                 if let Some(existing) = elements.iter_mut().find(|(p, _)| p == &path) {
                     existing.1 = Rc::new(factory);
                 } else {
-                    elements.push((path, Rc::new(factory)));
+                    elements.push((path.clone(), Rc::new(factory)));
+                }
+                drop(elements);
+                // 模式变化,元素 Trie 缓存失效(下次渲染重建)。
+                *router.elements_trie.borrow_mut() = None;
+                // 隐含 register:登记进路由模式表,params / is_active 自动生效
+                // (复用 register 的去重 + Trie 失效逻辑)。
+                let mut patterns = router.patterns.borrow_mut();
+                if !patterns.iter().any(|p| p == &path) {
+                    patterns.push(path);
+                    *router.matchit_cache.borrow_mut() = None;
                 }
             } else {
                 panic!("Router::register_element 在未启用时调用(需先 Router::init_*)");
@@ -466,8 +380,9 @@ impl Router {
 
     /// 渲染当前 Outlet 内容(Outlet 元素内部调用)。
     ///
-    /// 算法(最长前缀匹配 + 由内向外包裹):
-    /// 1. 在 `elements` 中找精确匹配当前路径的工厂,生成叶子元素;无匹配则用 `Empty`。
+    /// 算法(matchit 模式匹配 + 最长前缀 layout 包裹):
+    /// 1. 用元素 Trie 匹配当前路径,命中即调工厂生成叶子元素;无匹配则用 `Empty`。
+    ///    静态模式优先于动态模式(matchit 内建语义)。
     /// 2. 找所有"是当前路径前缀"的 layout,按路径长度**降序**排序(长的=具体的在前)。
     /// 3. 逐个用 layout 工厂包裹:element = layout(outlet=element)。
     ///
@@ -484,13 +399,28 @@ impl Router {
             };
             let current = router.pathname.get();
 
-            // 1. 找精确匹配的叶子工厂(clone Rc)。
-            let leaf = router
-                .elements
-                .borrow()
-                .iter()
-                .find(|(p, _)| p == &current)
-                .map(|(_, f)| Rc::clone(f));
+            // 1. matchit 匹配叶子工厂(clone Rc)。
+            //    Trie 缓存:value 存 elements 下标(只增不删,下标稳定)。
+            let leaf = {
+                let elements = router.elements.borrow();
+                if elements.is_empty() {
+                    None
+                } else {
+                    let mut cache = router.elements_trie.borrow_mut();
+                    let trie = cache.get_or_insert_with(|| {
+                        let mut t = matchit::Router::new();
+                        for (idx, (p, _)) in elements.iter().enumerate() {
+                            if let Err(e) = t.insert(p.as_ref(), idx) {
+                                eprintln!("routers: 跳过无效元素路由 {:?}: {}", p, e);
+                            }
+                        }
+                        t
+                    });
+                    trie.at(current.as_ref())
+                        .ok()
+                        .map(|m| Rc::clone(&elements[*m.value].1))
+                }
+            };
 
             // 2. 收集所有前缀匹配的 layout(路径 + clone Rc)。
             let layouts: Vec<(SharedString, LayoutFactory)> = router
@@ -796,262 +726,5 @@ impl Router {
         }
         history.push(path);
         *cursor = history.len() - 1;
-    }
-}
-
-/// 构建 matchit Trie(把 patterns 全部 insert,value 存模式字符串本身)。
-///
-/// **为什么 value 存模式字符串**:matchit 0.8 的 `Match.value` 是 insert 时存入的值,
-/// 不暴露匹配到的模式字符串。为了让 [`Router::is_active`] 能判断"当前路径匹配到哪个模式",
-/// 我们把模式字符串本身作为 value 存入,匹配后用 `matched.value == target` 比较。
-///
-/// 失败的模式(语法错误/冲突)被跳过 + eprintln 警告(不 panic)。
-/// 判断 `prefix` 是否是 `path` 的前缀(用于 Outlet 嵌套匹配)。
-///
-/// 规则(类 React Router):
-/// - `"/"` 是所有路径的前缀(根布局总是匹配)。
-/// - `"/settings"` 是 `/settings` 和 `/settings/profile` 的前缀。
-/// - `"/settings"` **不是** `/settings-account` 的前缀(段边界)。
-/// - `"/settings/"` 与 `"/settings"` 等价(尾斜杠忽略)。
-fn is_prefix_of(prefix: &str, path: &str) -> bool {
-    if prefix == "/" {
-        return true; // 根布局总是匹配。
-    }
-    let prefix = prefix.trim_end_matches('/');
-    let path = path.trim_end_matches('/');
-    if path == prefix {
-        return true;
-    }
-    path.strip_prefix(prefix)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-}
-
-/// 构建 matchit Trie(把 patterns 全部 insert,value 存模式字符串本身)。
-///
-/// **为什么 value 存模式字符串**:matchit 0.8 的 `Match.value` 是 insert 时存入的值,
-/// 不暴露匹配到的模式字符串。为了让 [`Router::is_active`] 能判断"当前路径匹配到哪个模式",
-/// 我们把模式字符串本身作为 value 存入,匹配后用 `matched.value == target` 比较。
-///
-/// 失败的模式(语法错误/冲突)被跳过 + eprintln 警告(不 panic)。
-fn build_matchit(patterns: &[SharedString]) -> matchit::Router<Box<str>> {
-    let mut trie = matchit::Router::new();
-    for pattern in patterns {
-        let value: Box<str> = pattern.as_ref().into();
-        if let Err(e) = trie.insert(pattern.as_ref(), value) {
-            eprintln!("routers: 跳过无效路由模式 {:?}: {}", pattern, e);
-        }
-    }
-    trie
-}
-
-/// NavIcon active 判定:**前缀匹配**(类 React Router NavLink 默认语义)。
-///
-/// - `target == "/"` 或 `exact == true`:要求 pathname 与 target 完全相等。
-/// - 否则:`/files` 在 `/files/sub` 时也算 active(前缀匹配 + 段边界)。
-///
-/// 段边界:`/files` 不会让 `/files-and-more` active(避免误判)。
-///
-/// **与 [`Router::is_active`] 的区别**:
-/// - `is_active_simple`:字符串前缀匹配,简单直观,NavIcon 默认用这个。
-/// - `Router::is_active`:matchit 精确匹配(支持动态段),需先 register 模式。
-pub fn is_active_simple(current: &str, target: &str, exact: bool) -> bool {
-    if target == "/" || exact {
-        return current == target;
-    }
-    if current == target {
-        return true;
-    }
-    current
-        .strip_prefix(target)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// Outlet 元素(路由器自动管理的内容占位符)
-// ════════════════════════════════════════════════════════════════════════
-
-/// **Outlet**:路由器自动管理的"内容占位符"元素。
-///
-/// 它代表"当前路由应该显示的内容"。路径变化时(经父视图重渲染触发),
-/// Outlet 自动 render 当前匹配的子元素(经 [`Router::render_outlet`]),
-/// **父布局不动**。
-///
-/// ## 工作原理
-///
-/// Outlet 是 gpui [`RenderOnce`] 元素。它**不自己订阅路由变化事件**,
-/// 而是随父视图重渲染——navigate 时 framework MainView 已订阅 RouteChanged
-/// 触发 `cx.notify()` → 父视图重渲染 → Outlet.render() 被调用 → 拿最新内容。
-///
-/// ## 使用示例
-///
-/// ### 场景 1:简单父布局 + Outlet(IDE 经典布局)
-///
-/// ```ignore
-/// // Plugin::build 里注册根布局:
-/// Router::register_layout("/", |outlet: AnyElement| -> AnyElement {
-///     div()
-///       .child(NavBar::new())    // 左侧导航(常驻)
-///       .child(outlet)           // ← 子内容(Outlet 自动塞)
-///       .into_any_element()
-/// });
-/// Router::register_element("/files", |w, cx| FilesPanel::render(w, cx));
-///
-/// // 主视图 render:
-/// impl Render for MainView {
-///     fn render(&mut self, w, cx) -> impl IntoElement {
-///         Outlet::new()   // ★ 一行接入
-///     }
-/// }
-/// ```
-///
-/// ### 场景 2:多层嵌套
-///
-/// ```ignore
-/// Router::register_layout("/", |o| TitleBar::new().child(o).into());
-/// Router::register_layout("/settings", |o| SettingsSidebar::new().child(o).into());
-/// Router::register_element("/settings/profile", |w, cx| ProfilePanel::render(w, cx));
-/// // navigate("/settings/profile") 自动渲染:
-/// // TitleBar > SettingsSidebar > ProfilePanel
-/// ```
-#[derive(gpui::IntoElement)]
-pub struct Outlet;
-
-impl Outlet {
-    /// 创建一个 Outlet 元素。
-    ///
-    /// 放进任意父布局或主视图,路由变化时自动 render 当前子内容。
-    pub fn new() -> Self {
-        Outlet
-    }
-}
-
-impl Default for Outlet {
-    fn default() -> Self {
-        Outlet
-    }
-}
-
-impl RenderOnce for Outlet {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        // 委托给 Router::render_outlet,获取当前匹配的内容。
-        // 若 Router 未启用,render_outlet 返回 Empty(优雅降级)。
-        Router::render_outlet(window, cx)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    //! 纯函数单测(不依赖 gpui App / 全局 Router)。
-    //!
-    //! navigate / back / forward / 守卫 / 持久化 / restore / Outlet 的**真实运行时行为**
-    //! 由 `tests/e2e.rs`(gpui TestAppContext 端到端集成测试)覆盖,这里只保留
-    //! 纯算法函数(`is_active_simple` / `build_matchit` / `is_prefix_of`)的单测。
-    use super::*;
-
-    // ══════════════════════════════════════════════════════════════════
-    // is_active_simple(NavIcon 默认的前缀匹配语义)
-    // ══════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_root_only_active_on_exact_root() {
-        assert!(is_active_simple("/", "/", false));
-        assert!(!is_active_simple("/files", "/", false));
-    }
-
-    #[test]
-    fn test_prefix_match_includes_descendants() {
-        assert!(is_active_simple("/files/sub", "/files", false));
-        assert!(is_active_simple("/files/", "/files", false));
-        assert!(is_active_simple("/files", "/files", false));
-    }
-
-    #[test]
-    fn test_exact_match_strict() {
-        assert!(is_active_simple("/files", "/files", true));
-        assert!(!is_active_simple("/files/sub", "/files", true));
-    }
-
-    #[test]
-    fn test_segment_boundary_not_false_positive() {
-        assert!(!is_active_simple("/files-and-more", "/files", false));
-        assert!(!is_active_simple("/files2", "/files", false));
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // build_matchit(动态路由匹配引擎)
-    // ══════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_matchit_dynamic_segment_match() {
-        let trie = build_matchit(&[
-            "/home".into(),
-            "/user/{id}".into(),
-            "/files/{*path}".into(),
-        ]);
-        // 静态匹配。
-        assert!(trie.at("/home").is_ok());
-        // 动态段:匹配并提取参数。
-        let matched = trie.at("/user/123").unwrap();
-        assert_eq!(matched.params.get("id"), Some("123"));
-        // 通配段:匹配多级路径。
-        let matched = trie.at("/files/a/b/c").unwrap();
-        assert_eq!(matched.params.get("path"), Some("a/b/c"));
-    }
-
-    #[test]
-    fn test_matchit_value_stores_pattern_string() {
-        // value 存模式字符串本身,用于 is_active 比较。
-        let trie = build_matchit(&["/user/{id}".into()]);
-        let matched = trie.at("/user/123").unwrap();
-        assert_eq!(matched.value.as_ref(), "/user/{id}");
-    }
-
-    #[test]
-    fn test_matchit_no_match_returns_err() {
-        let trie = build_matchit(&["/home".into()]);
-        assert!(trie.at("/nonexistent").is_err());
-    }
-
-    #[test]
-    fn test_matchit_segment_count_must_match() {
-        // /user/{id} 只匹配 1 段,/user/123/456 不匹配。
-        let trie = build_matchit(&["/user/{id}".into()]);
-        assert!(trie.at("/user/123").is_ok());
-        assert!(trie.at("/user/123/456").is_err());
-    }
-
-    #[test]
-    fn test_build_matchit_skips_invalid_pattern() {
-        // 无效模式(语法错误)被跳过,不 panic。
-        let trie = build_matchit(&["/valid".into(), "{invalid".into()]);
-        assert!(trie.at("/valid").is_ok());
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // is_prefix_of(Outlet 嵌套 layout 的前缀匹配语义)
-    // ══════════════════════════════════════════════════════════════════
-
-    /// 根布局 "/" 总是匹配。
-    #[test]
-    fn test_is_prefix_of_root_matches_all() {
-        assert!(is_prefix_of("/", "/"));
-        assert!(is_prefix_of("/", "/files"));
-        assert!(is_prefix_of("/", "/settings/profile"));
-    }
-
-    /// 具体前缀匹配。
-    #[test]
-    fn test_is_prefix_of_concrete_prefix() {
-        assert!(is_prefix_of("/settings", "/settings"));
-        assert!(is_prefix_of("/settings", "/settings/profile"));
-        assert!(is_prefix_of("/settings", "/settings/"));
-    }
-
-    /// 段边界(避免 /settings 匹配 /settings-account)。
-    #[test]
-    fn test_is_prefix_of_segment_boundary() {
-        assert!(!is_prefix_of("/settings", "/settings-account"));
-        assert!(!is_prefix_of("/settings", "/settings2"));
-        assert!(!is_prefix_of("/user", "/users"));
     }
 }

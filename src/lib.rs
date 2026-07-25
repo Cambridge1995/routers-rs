@@ -29,9 +29,15 @@
 //! Router::init_with(MyBus);
 //! ```
 
+mod event_bus;
+mod matching;
+mod outlet;
 mod router;
 
-pub use router::{Router, RouterEventBus, NoopEventBus, Outlet, is_active_simple};
+pub use event_bus::{NoopEventBus, RouterEventBus};
+pub use matching::is_active_simple;
+pub use outlet::Outlet;
+pub use router::Router;
 
 // 统一 re-export,使用方只依赖本 crate,避免版本错位。
 // 使用方经 `routers::gpui::*` / `routers::reactive_graph::*` 访问。
