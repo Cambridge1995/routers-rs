@@ -2,7 +2,7 @@
 # 发布名:routers(crates.io)已被占用,用 routers-rs;lib 名保留 routers(见下方 [lib]),
 # 使用方代码 `use routers::...` 不受影响。
 name = "routers-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "基于 reactive_graph 的响应式路由器,为 gpui 桌面应用而生(pathname 单一事实来源 + 历史栈 + 路由守卫 + 嵌套布局 + 持久化恢复)"

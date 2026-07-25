@@ -69,7 +69,7 @@ crate 名是 **`routers-rs`**(crates.io 上 `routers` 已被占用),lib 名仍�
 [dependencies]
 routers = { package = "routers-rs", git = "https://github.com/Cambridge1995/routers-rs" }
 # 或(crates.io 发布后):
-routers = { package = "routers-rs", version = "0.1.0" }
+routers = { package = "routers-rs", version = "0.1.1" }
 ```
 
 ## 使用教程
