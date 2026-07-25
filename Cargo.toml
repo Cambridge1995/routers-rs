@@ -1,0 +1,30 @@
+[package]
+# 发布名:routers(crates.io)已被占用,用 routers-rs;lib 名保留 routers(见下方 [lib]),
+# 使用方代码 `use routers::...` 不受影响。
+name = "routers-rs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "基于 reactive_graph 的响应式路由器,为 gpui 桌面应用而生(pathname 单一事实来源 + 历史栈 + 路由守卫 + 嵌套布局 + 持久化恢复)"
+keywords = ["gpui", "router", "routing", "reactive", "desktop"]
+categories = ["gui"]
+readme = "README.md"
+# repository 待 GitHub 仓库创建后补充(crates.io 要求真实可访问的 URL)。
+
+[lib]
+# lib 名保持 routers:framework/demo 的 `use routers::...` 与 `routers = { package = ... }` 依赖写法不变。
+name = "routers"
+
+[dependencies]
+gpui = "0.2.2"
+# 响应式核心:leptos 官方独立 crate,桌面目标不拉 web-sys(已实测验证)。
+# 用于 Router 的 RwSignal<SharedString>(pathname 单一事实来源)。
+reactive_graph = "0.2"
+# 路由匹配引擎:Trie 实现,支持静态/动态段 {id}/通配 {*splat}。
+# gpui-router 已验证可用。Router 内部用 OnceCell 缓存 Trie,首次匹配后零开销。
+matchit = "0.9.1"
+
+[dev-dependencies]
+# 端到端集成测试用:TestAppContext / add_empty_window 需要 test-support feature。
+# 与 framework 的 dev-dependencies 同款姿势(不随发布 crate 拉入)。
+gpui = { version = "0.2.2", features = ["test-support"] }
