@@ -1,7 +1,6 @@
 //! 路由匹配引擎封装:matchit Trie 构建 + 前缀/active 判定纯函数。
 
-use gpui::SharedString;
-
+use gpui_kit::SharedString;
 
 /// 判断 `prefix` 是否是 `path` 的前缀(用于 Outlet 嵌套匹配)。
 ///
@@ -25,7 +24,7 @@ pub(crate) fn is_prefix_of(prefix: &str, path: &str) -> bool {
 
 /// 构建 matchit Trie(把 patterns 全部 insert,value 存模式字符串本身)。
 ///
-/// **为什么 value 存模式字符串**:matchit 0.8 的 `Match.value` 是 insert 时存入的值,
+/// **为什么 value 存模式字符串**:`Match.value` 是 insert 时存入的值,
 /// 不暴露匹配到的模式字符串。为了让 [`crate::Router::is_active`] 能判断"当前路径匹配到哪个模式",
 /// 我们把模式字符串本身作为 value 存入,匹配后用 `matched.value == target` 比较。
 ///
@@ -62,7 +61,6 @@ pub fn is_active_simple(current: &str, target: &str, exact: bool) -> bool {
         .strip_prefix(target)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -108,11 +106,7 @@ mod tests {
 
     #[test]
     fn test_matchit_dynamic_segment_match() {
-        let trie = build_matchit(&[
-            "/home".into(),
-            "/user/{id}".into(),
-            "/files/{*path}".into(),
-        ]);
+        let trie = build_matchit(&["/home".into(), "/user/{id}".into(), "/files/{*path}".into()]);
         // 静态匹配。
         assert!(trie.at("/home").is_ok());
         // 动态段:匹配并提取参数。

@@ -1,475 +1,368 @@
-//! routers 全功能可视化演示(独立 gpui 应用,零 framework/gpui-component 依赖)。
-//!
-//! 运行:`cargo run -p routers-rs --example router_demo`
-//!
-//! 一个窗口看全 routers 的公开能力:
-//! - **navigate**:左侧导航栏点击切换,active 态自动高亮(matchit 语义)。
-//! - **动态路由**:`/user/{id}` 注册一次,`/user/42` `/user/7` 都命中,内容区实时显示 params。
-//! - **history back/forward**:顶栏 ◀ ▶ 按钮,置灰跟随 can_go_back/can_go_forward。
-//! - **嵌套 Outlet**:RootLayout(/) 常驻包裹;`/settings/*` 再套一层 SettingsLayout。
-//! - **路由守卫**:顶栏「守卫锁定」开关,开启后 `/admin` 被 allow_navigate 拦截,
-//!   navigate 返回 false,内容区不变;「强制进入」走 navigate_force 绕过。
-//! - **持久化/恢复**:每次导航写入系统临时目录 `routers-demo-route.json`,
-//!   下次启动自动恢复到上次页面(Router::restore)。
-//! - **事件钩子**:每次 RouteChanged 在 stdout 打印(publish_route_changed)。
+//! 可运行示例：`cargo run --example router_demo`。
 
 use std::cell::Cell;
 use std::rc::Rc;
 
-use routers::gpui::prelude::*;
-use routers::gpui::{
-    App, AppContext, Application, Bounds, ClickEvent, Context, FontWeight, SharedString, Window,
-    WindowBounds, WindowOptions, div, px, rgb,
+use routers::gpui_kit::base::StyledExt;
+use routers::gpui_kit::component::{
+    ActiveTheme, Disableable, Selectable, Sizable, button::Button, switch::Switch,
 };
-use routers::{Outlet, Router, RouterEventBus};
+use routers::gpui_kit::{
+    App, AppContext, Bounds, Context, Entity, IntoElement, ParentElement, Render, SharedString,
+    Styled, Subscription, Window, WindowBounds, WindowOptions, application, div, init, open_window,
+    px, size,
+};
+use routers::{Outlet, Route, RouteChanged, Router, RouterDelegate};
 
-// ════════════════════════════════════════════════════════════════════════
-// 演示用 EventBus:守卫 + 持久化 + 恢复 + 事件打印
-// ════════════════════════════════════════════════════════════════════════
-
-struct DemoBus {
-    /// 守卫开关(与 UI 共享,单线程 Rc)。
+struct DemoDelegate {
     guard_on: Rc<Cell<bool>>,
-    /// 持久化文件路径(系统临时目录,演示用)。
     store_path: std::path::PathBuf,
 }
 
-impl RouterEventBus for DemoBus {
-    fn publish_route_changed(&self, _cx: &mut App, path: SharedString) {
-        // 事件钩子演示:真实项目会转发到自己的 EventBus / gpui emit。
-        println!("[RouteChanged] {path}");
-    }
-
+impl RouterDelegate for DemoDelegate {
     fn allow_navigate(
         &self,
         _cx: &mut App,
-        _from: SharedString,
-        to: SharedString,
+        _from: &SharedString,
+        to: &SharedString,
     ) -> Result<bool, SharedString> {
         if self.guard_on.get() && to.starts_with("/admin") {
-            return Err("守卫锁定中:未登录,拒绝进入 /admin".into());
+            return Err("守卫已开启，进入后台需要确认".into());
         }
         Ok(true)
     }
 
     fn persist_pathname(&self, _cx: &mut App, path: &SharedString) {
-        // 持久化钩子:写系统临时目录(演示,不污染任何 config/)。
-        let _ = std::fs::write(&self.store_path, path.as_str());
+        if let Err(error) = std::fs::write(&self.store_path, path.as_str()) {
+            eprintln!("无法保存演示路径：{error}");
+        }
     }
 
     fn restore_pathname(&self, _cx: &App) -> Option<SharedString> {
-        std::fs::read_to_string(&self.store_path)
-            .ok()
-            .map(SharedString::from)
+        match std::fs::read_to_string(&self.store_path) {
+            Ok(path) => Some(path.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                eprintln!("无法读取演示路径：{error}");
+                None
+            }
+        }
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// 主视图
-// ════════════════════════════════════════════════════════════════════════
-
-/// 导航项:(目标路径, 显示名, active 判定用的模式)。
 const NAV_ITEMS: &[(&str, &str, &str)] = &[
     ("/files", "文件", "/files"),
     ("/search", "搜索", "/search"),
     ("/user/42", "用户 42", "/user/{id}"),
     ("/user/7", "用户 7", "/user/{id}"),
-    ("/settings/profile", "设置·档案", "/settings/profile"),
-    ("/settings/account", "设置·账户", "/settings/account"),
-    ("/admin/panel", "后台(受守卫)", "/admin/panel"),
+    ("/settings/profile", "档案", "/settings/profile"),
+    ("/settings/account", "账户", "/settings/account"),
+    ("/admin/panel", "后台", "/admin/panel"),
 ];
 
 struct DemoView {
+    router: Entity<Router>,
     guard_on: Rc<Cell<bool>>,
-    /// 最近一次导航的结果提示(演示 navigate 返回值)。
     last_message: SharedString,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl DemoView {
-    fn new(guard_on: Rc<Cell<bool>>) -> Self {
+    fn new(router: Entity<Router>, guard_on: Rc<Cell<bool>>, cx: &mut Context<Self>) -> Self {
+        let observation = cx.observe(&router, |_, _, cx| cx.notify());
+        let event_subscription = cx.subscribe(&router, |_, _, event: &RouteChanged, _| {
+            println!("[RouteChanged] {}", event.pathname())
+        });
         Self {
+            router,
             guard_on,
-            last_message: "点击左侧导航开始".into(),
+            last_message: "选择左侧页面开始导航".into(),
+            _subscriptions: vec![observation, event_subscription],
         }
     }
 
-    /// 导航 + 结果反馈(navigate 返回 false = 被守卫拦截)。
     fn go(&mut self, target: &'static str, force: bool, cx: &mut Context<Self>) {
-        let ok = if force {
-            Router::navigate_force(cx, target)
+        let succeeded = self.router.update(cx, |router, cx| {
+            if force {
+                router.navigate_force(cx, target)
+            } else {
+                router.navigate(cx, target)
+            }
+        });
+        self.last_message = if succeeded {
+            format!("已进入 {target}").into()
         } else {
-            Router::navigate(cx, target)
-        };
-        self.last_message = if ok {
-            format!("navigate({target}) → true").into()
-        } else {
-            format!("navigate({target}) → false · 被守卫拦截,内容区未变").into()
+            format!("前往 {target} 被守卫拒绝，当前页面未变").into()
         };
         cx.notify();
     }
 
-    /// active 判定:
-    /// - `pattern` 与 `target` 相同(静态路由)→ 用 matchit 模式语义 [`Router::is_active`]。
-    /// - `pattern` 是动态模式(如 /user/{id})而 `target` 是具体路径 → 模式语义会让
-    ///   同模式的多个入口同时命中,故改用精确匹配(类 NavLink exact)。
-    fn nav_button(&self, target: &'static str, label: &str, pattern: &str, cx: &Context<Self>) -> impl IntoElement {
-        let active = if pattern == target {
-            Router::is_active(pattern)
-        } else {
-            routers::is_active_simple(&Router::current(), target, /*exact=*/ true)
-        };
-        let (bg, fg) = if active {
-            (rgb(0x2f5fd0), rgb(0xffffff))
-        } else {
-            (rgb(0x23232e), rgb(0xb8b8c8))
-        };
-        div()
-            .id(SharedString::from(format!("nav-{target}")))
-            .px_3()
-            .py_2()
-            .mb_1()
-            .rounded_md()
-            .bg(bg)
-            .text_color(fg)
-            .text_sm()
-            .cursor_pointer()
-            .hover(|s| s.bg(if active { rgb(0x2f5fd0) } else { rgb(0x2c2c3a) }))
-            .child(format!("{label}   {target}"))
-            .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
-                this.go(target, false, cx);
-            }))
+    fn nav_button(
+        &self,
+        target: &'static str,
+        label: &str,
+        pattern: &str,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let active = self.router.read(cx).is_active(pattern)
+            && (pattern == target
+                || routers::is_active_simple(self.router.read(cx).current(), target, true));
+        Button::new(format!("nav-{target}"))
+            .label(format!("{label} · {target}"))
+            .selected(active)
+            .on_click(cx.listener(move |this, _, _, cx| this.go(target, false, cx)))
     }
 }
 
 impl Render for DemoView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let current = Router::current();
-        let can_back = Router::can_go_back();
-        let can_fwd = Router::can_go_forward();
-        let history = format!("history: cursor={} len={}", Router::cursor(), Router::history_len());
-        let params = Router::params();
-        let params_text = if params.is_empty() {
-            "params: (无)".to_string()
-        } else {
-            let mut pairs: Vec<String> = params
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect();
-            pairs.sort();
-            format!("params: {}", pairs.join(", "))
+        let (current, can_back, can_forward, history, params) = {
+            let router = self.router.read(cx);
+            let params = if router.params().is_empty() {
+                "无".to_string()
+            } else {
+                let mut values: Vec<String> = router
+                    .params()
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect();
+                values.sort();
+                values.join(", ")
+            };
+            (
+                router.current().clone(),
+                router.can_go_back(),
+                router.can_go_forward(),
+                format!("历史 {} / {}", router.cursor() + 1, router.history_len()),
+                params,
+            )
         };
-        let guard_on = self.guard_on.get();
 
-        // ── 顶栏:back/forward + 当前路径 + 守卫开关 ──
-        let nav_btn = |id: &'static str, label: &str, enabled: bool| {
-            div()
-                .id(id)
-                .px_3()
-                .py_1()
-                .mr_2()
-                .rounded_md()
-                .text_sm()
-                .bg(if enabled { rgb(0x2c2c3a) } else { rgb(0x1c1c24) })
-                .text_color(if enabled { rgb(0xffffff) } else { rgb(0x555560) })
-                .when(enabled, |el| {
-                    el.cursor_pointer().hover(|s| s.bg(rgb(0x38384a)))
-                })
-                .child(label.to_string())
-        };
-        let top_bar = div()
-            .flex()
-            .items_center()
-            .px_3()
-            .py_2()
-            .bg(rgb(0x16161d))
-            .child(
-                nav_btn("btn-back", "◀ back", can_back).on_click(
-                    cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                        let ok = Router::back(cx);
-                        this.last_message = format!("back() → {ok}").into();
-                        cx.notify();
-                    }),
-                ),
-            )
-            .child(
-                nav_btn("btn-fwd", "forward ▶", can_fwd).on_click(
-                    cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                        let ok = Router::forward(cx);
-                        this.last_message = format!("forward() → {ok}").into();
-                        cx.notify();
-                    }),
-                ),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0x7fd4a0))
-                    .child(format!("当前: {current}")),
-            )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .id("btn-guard")
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .text_sm()
-                    .cursor_pointer()
-                    .bg(if guard_on { rgb(0x8c3a3a) } else { rgb(0x2c2c3a) })
-                    .text_color(rgb(0xffffff))
-                    .hover(|s| s.bg(if guard_on { rgb(0xa04848) } else { rgb(0x38384a) }))
-                    .child(if guard_on {
-                        "守卫锁定: 开 (/admin 将被拦截)"
-                    } else {
-                        "守卫锁定: 关"
-                    })
-                    .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                        let new = !this.guard_on.get();
-                        this.guard_on.set(new);
-                        this.last_message = format!("守卫锁定 → {new}").into();
-                        cx.notify();
-                    })),
-            );
-
-        // ── 状态行:history / params / 最近导航结果 ──
-        let status_bar = div()
-            .flex()
-            .items_center()
-            .gap_4()
-            .px_3()
-            .py_1()
-            .bg(rgb(0x1a1a22))
-            .text_xs()
-            .text_color(rgb(0x8a8a9a))
-            .child(history)
-            .child(params_text)
-            .child(self.last_message.clone());
-
-        // ── 左侧导航栏 ──
         let mut sidebar = div()
             .flex()
             .flex_col()
-            .w(px(240.))
+            .w_64()
             .p_3()
-            .bg(rgb(0x16161d))
+            .gap_1()
+            .bg(cx.theme().sidebar)
             .child(
                 div()
+                    .font_medium()
                     .text_sm()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(0xe8e8f0))
-                    .mb_2()
-                    .child("routers 全功能演示"),
+                    .pb_2()
+                    .child("routers 导航示例"),
             );
-        for (target, label, pattern) in NAV_ITEMS {
+        for &(target, label, pattern) in NAV_ITEMS {
             sidebar = sidebar.child(self.nav_button(target, label, pattern, cx));
         }
-        // 强制进入演示:navigate_force 绕过守卫。
-        sidebar = sidebar.child(
-            div()
-                .id("btn-force-admin")
-                .px_3()
-                .py_2()
-                .mt_2()
-                .rounded_md()
-                .text_sm()
-                .cursor_pointer()
-                .bg(rgb(0x4a3a20))
-                .text_color(rgb(0xe8c97f))
-                .hover(|s| s.bg(rgb(0x5c4a28)))
-                .child("强制进入 /admin (navigate_force)")
-                .on_click(cx.listener(|this, _e: &ClickEvent, _w, cx| {
-                    this.go("/admin/panel", true, cx);
-                })),
-        );
-
-        // ── 内容区:Outlet(路由自动管理的内容占位符)──
-        let content = div()
-            .flex_1()
-            .p_3()
-            .bg(rgb(0x101016))
-            .child(Outlet::new());
 
         div()
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x101016))
-            .text_color(rgb(0xe8e8f0))
-            .child(top_bar)
-            .child(status_bar)
-            .child(div().flex().flex_1().child(sidebar).child(content))
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .p_3()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        Button::new("back")
+                            .label("后退")
+                            .small()
+                            .disabled(!can_back)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let succeeded =
+                                    this.router.update(cx, |router, cx| router.back(cx));
+                                this.last_message = if succeeded {
+                                    "已后退".into()
+                                } else {
+                                    "无法后退".into()
+                                };
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("forward")
+                            .label("前进")
+                            .small()
+                            .disabled(!can_forward)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let succeeded =
+                                    this.router.update(cx, |router, cx| router.forward(cx));
+                                this.last_message = if succeeded {
+                                    "已前进".into()
+                                } else {
+                                    "无法前进".into()
+                                };
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().text_sm().child(format!("当前路径：{current}")))
+                    .child(div().flex_1())
+                    .child(
+                        Switch::new("guard")
+                            .label("守卫拦截后台")
+                            .checked(self.guard_on.get())
+                            .on_change(cx.listener(|this, enabled, _, cx| {
+                                this.guard_on.set(*enabled);
+                                this.last_message = if *enabled {
+                                    "普通后台导航将被拒绝".into()
+                                } else {
+                                    "后台守卫已关闭".into()
+                                };
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_4()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(history)
+                    .child(format!("参数：{params}"))
+                    .child(self.last_message.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_stretch()
+                    .flex_1()
+                    .min_h_0()
+                    .child(sidebar)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .p_4()
+                            .gap_3()
+                            .child(
+                                Button::new("force-admin")
+                                    .label("确认并强制进入后台")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.go("/admin/panel", true, cx);
+                                    })),
+                            )
+                            .child(div().flex_1().min_h_0().child(Outlet::new(&self.router))),
+                    ),
+            )
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// 内容面板(element 工厂):每个路由一个内容
-// ════════════════════════════════════════════════════════════════════════
-
-/// 统一的内容面板样式:标题 + 描述 + 实时 params。
-fn panel(title: &str, desc: &str, accent: u32) -> impl IntoElement {
-    let params = Router::params();
-    let params_text = if params.is_empty() {
-        String::new()
+fn panel(route: &Route, title: &str, description: &str, cx: &mut App) -> impl IntoElement {
+    let params = if route.params().is_empty() {
+        "当前路由没有动态参数".to_string()
     } else {
-        let mut pairs: Vec<String> = params
+        let mut values: Vec<String> = route
+            .params()
             .iter()
-            .map(|(k, v)| format!("{k} = {v}"))
+            .map(|(key, value)| format!("{key} = {value}"))
             .collect();
-        pairs.sort();
-        format!("动态参数(Router::params()):  {}", pairs.join(",  "))
+        values.sort();
+        format!("动态参数：{}", values.join(", "))
     };
     div()
         .flex()
         .flex_col()
         .size_full()
+        .gap_2()
         .p_4()
-        .rounded_md()
-        .bg(rgb(0x181822))
-        .child(
-            div()
-                .text_lg()
-                .font_weight(FontWeight::BOLD)
-                .text_color(rgb(accent))
-                .mb_2()
-                .child(title.to_string()),
-        )
+        .rounded(cx.theme().radius)
+        .bg(cx.theme().group_box)
+        .child(div().text_lg().font_medium().child(title.to_string()))
+        .child(div().text_sm().child(description.to_string()))
         .child(
             div()
                 .text_sm()
-                .text_color(rgb(0xa0a0b0))
-                .child(desc.to_string()),
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("路径：{}", route.pathname())),
         )
-        .when(!params_text.is_empty(), |el| {
-            el.child(
-                div()
-                    .mt_3()
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .bg(rgb(0x20301f))
-                    .text_sm()
-                    .text_color(rgb(0x7fd4a0))
-                    .child(params_text),
-            )
-        })
+        .child(div().text_sm().child(params))
 }
 
-fn register_routes() {
-    // ① 路由模式:静态 + 动态段(matchit 语义,供 params / is_active 使用)。
-    Router::register("/files");
-    Router::register("/search");
-    Router::register("/settings/profile");
-    Router::register("/settings/account");
-    Router::register("/admin/panel");
-    // 注:/user/{id} 无需显式 register——下方 register_element 隐含登记。
-
-    // ② 内容元素:每个路由一个工厂。
-    Router::register_element("/files", |_w, _cx| {
-        panel("📁 文件面板", "路径 /files · 静态路由", 0x7fb8ff).into_any_element()
+fn register_routes(router: &mut Router) {
+    router.register_element("/files", |route, _, cx| {
+        panel(route, "文件", "静态路由 /files", cx).into_any_element()
     });
-    Router::register_element("/search", |_w, _cx| {
-        panel("🔍 搜索面板", "路径 /search · 静态路由", 0xc9a0ff).into_any_element()
+    router.register_element("/search", |route, _, cx| {
+        panel(route, "搜索", "静态路由 /search", cx).into_any_element()
     });
-    // ★ 动态模式叶子(0.2 新能力):一条注册覆盖所有 /user/*,params 自动填充。
-    Router::register_element("/user/{id}", |_w, _cx| {
-        panel(
-            "👤 用户面板",
-            &format!("动态模式 /user/{{id}} · 当前 id = {}", Router::params().get("id").map(|v| v.as_ref()).unwrap_or("?")),
-            0x7fd4a0,
-        )
-        .into_any_element()
+    router.register_element("/user/{id}", |route, _, cx| {
+        panel(route, "用户", "动态路由 /user/{id}", cx).into_any_element()
     });
-    Router::register_element("/settings/profile", |_w, _cx| {
-        panel("⚙ 档案设置", "路径 /settings/profile · 被 /settings 布局嵌套", 0xe8c97f)
-            .into_any_element()
+    router.register_element("/settings/profile", |route, _, cx| {
+        panel(route, "档案", "嵌套在设置布局中", cx).into_any_element()
     });
-    Router::register_element("/settings/account", |_w, _cx| {
-        panel("⚙ 账户设置", "路径 /settings/account · 被 /settings 布局嵌套", 0xe8c97f)
-            .into_any_element()
+    router.register_element("/settings/account", |route, _, cx| {
+        panel(route, "账户", "嵌套在设置布局中", cx).into_any_element()
     });
-    Router::register_element("/admin/panel", |_w, _cx| {
-        panel("🛡 后台面板", "路径 /admin/panel · 守卫锁定开启时普通导航会被拦截,仅 navigate_force 可达", 0xff8f8f)
-            .into_any_element()
+    router.register_element("/admin/panel", |route, _, cx| {
+        panel(route, "后台", "守卫开启时可使用强制导航进入", cx).into_any_element()
     });
-
-    // ③ 嵌套布局:/settings 布局(内层)套在 RootLayout(外层)之内。
-    Router::register_layout("/", |outlet| {
+    router.register_layout("/", |outlet| {
         div()
             .flex()
             .flex_col()
             .size_full()
-            .p_3()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(0x2c2c3a))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x666677))
-                    .mb_2()
-                    .child("RootLayout(/) · 常驻根布局 · register_layout(\"/\")"),
-            )
-            .child(div().flex_1().child(outlet))
+            .gap_2()
+            .child(div().text_xs().child("根布局 /"))
+            .child(div().flex_1().min_h_0().child(outlet))
             .into_any_element()
     });
-    Router::register_layout("/settings", |outlet| {
+    router.register_layout("/settings", |outlet| {
         div()
             .flex()
             .flex_col()
             .size_full()
+            .gap_2()
             .p_3()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(0x5c4a28))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0xe8c97f))
-                    .mb_2()
-                    .child("SettingsLayout(/settings) · 嵌套布局 · 仅 /settings/* 路径出现"),
-            )
-            .child(div().flex_1().child(outlet))
+            .child(div().text_xs().child("设置布局 /settings"))
+            .child(div().flex_1().min_h_0().child(outlet))
             .into_any_element()
     });
 }
-
-// ════════════════════════════════════════════════════════════════════════
-// 入口:init → register → restore → 开窗
-// ════════════════════════════════════════════════════════════════════════
 
 fn main() {
     let guard_on = Rc::new(Cell::new(false));
-    let store_path = std::env::temp_dir().join("routers-demo-route.json");
-    println!("持久化文件: {}", store_path.display());
+    let store_path = std::env::temp_dir().join("routers-demo-route.txt");
+    println!("持久化文件：{}", store_path.display());
 
-    let guard_for_bus = Rc::clone(&guard_on);
-    Application::new().run(move |cx: &mut App| {
-        // ① 初始化 Router(注入演示 bus:守卫 + 持久化 + 恢复 + 打印)。
-        Router::init_with(DemoBus {
-            guard_on: guard_for_bus,
-            store_path,
+    application().run(move |cx| {
+        init(cx);
+        let router = cx.new(|_| {
+            Router::with_delegate(DemoDelegate {
+                guard_on: Rc::clone(&guard_on),
+                store_path,
+            })
         });
-        // ② 注册路由模式 + 内容元素 + 嵌套布局。
-        register_routes();
-        // ③ 恢复上次页面(读临时目录的持久化文件;无记录则保持 "/")。
-        Router::restore(cx);
-        println!("[启动] 恢复到: {}", Router::current());
+        router.update(cx, |router, _| register_routes(router));
+        router.update(cx, |router, cx| {
+            router.restore(cx);
+        });
+        println!("[启动] 当前路径：{}", router.read(cx).current());
 
-        let bounds = Bounds::centered(None, gpui_size(px(980.), px(640.)), cx);
-        let guard_for_view = Rc::clone(&guard_on);
-        cx.open_window(
+        let bounds = Bounds::centered(None, size(px(980.), px(640.)), cx);
+        open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            move |_window, cx| cx.new(|_cx| DemoView::new(Rc::clone(&guard_for_view))),
+            cx,
+            move |window, cx| {
+                window.set_window_title("routers 路由示例");
+                cx.new(|cx| DemoView::new(router.clone(), Rc::clone(&guard_on), cx))
+            },
         )
-        .unwrap();
+        .expect("无法创建 routers 示例窗口");
         cx.activate(true);
     });
-}
-
-/// gpui::size 的薄包装(避免与顶栏变量名混淆)。
-fn gpui_size(w: gpui::Pixels, h: gpui::Pixels) -> gpui::Size<gpui::Pixels> {
-    gpui::size(w, h)
 }

@@ -1,38 +1,28 @@
-//! routers 端到端集成测试:用 gpui `TestAppContext` 驱动**真实**的
-//! navigate / back / forward / 守卫 / 动态参数 / 持久化 / restore / Outlet 渲染。
-//!
-//! 与 `router.rs` 内的纯算法单测互补——这里全部走公开 API,验证真实运行时行为。
-//!
-//! 实现要点:Router 是 thread_local 单例,Rust 测试 harness 给每个 `#[test]`
-//! 分配独立线程,因此每个测试天然拿到全新的 Router,`init_*` 互不干扰。
+//! 通过公开 API 验证导航、历史、守卫、恢复、事件和 Outlet。
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use routers::gpui::{App, IntoElement, ParentElement, RenderOnce, SharedString, TestAppContext, div};
-use routers::{Outlet, Router, RouterEventBus};
+use routers::gpui_kit::{
+    App, AppContext, Entity, IntoElement, ParentElement, RenderOnce, SharedString, TestAppContext,
+    div,
+};
+use routers::{Outlet, RouteChanged, Router, RouterDelegate};
 
-// ════════════════════════════════════════════════════════════════════════
-// 测试基础设施:记录型 EventBus
-// ════════════════════════════════════════════════════════════════════════
+type PersistedPaths = Rc<RefCell<Vec<SharedString>>>;
+type GuardCalls = Rc<RefCell<Vec<(SharedString, SharedString)>>>;
 
-/// 记录 publish/persist 调用序列,支持按前缀配置守卫拦截(Err / 静默两种),
-/// 支持预设 restore 返回值。记录经 `Rc<RefCell>` 与测试共享(单线程测试)。
-struct RecBus {
-    published: Rc<RefCell<Vec<SharedString>>>,
-    persisted: Rc<RefCell<Vec<SharedString>>>,
-    guard_calls: Rc<RefCell<Vec<(SharedString, SharedString)>>>,
-    /// 命中前缀 → 守卫返回 Err(带错误信息取消)。
+struct RecDelegate {
+    persisted: PersistedPaths,
+    guard_calls: GuardCalls,
     blocked_err: Vec<&'static str>,
-    /// 命中前缀 → 守卫返回 Ok(false)(静默取消)。
     blocked_silent: Vec<&'static str>,
     saved: Option<SharedString>,
 }
 
-impl RecBus {
+impl RecDelegate {
     fn new() -> Self {
         Self {
-            published: Rc::new(RefCell::new(Vec::new())),
             persisted: Rc::new(RefCell::new(Vec::new())),
             guard_calls: Rc::new(RefCell::new(Vec::new())),
             blocked_err: Vec::new(),
@@ -41,40 +31,29 @@ impl RecBus {
         }
     }
 
-    /// 取出记录句柄(bus 移交 Router 后,测试侧仍可读记录)。
-    fn handles(
-        &self,
-    ) -> (
-        Rc<RefCell<Vec<SharedString>>>,
-        Rc<RefCell<Vec<SharedString>>>,
-        Rc<RefCell<Vec<(SharedString, SharedString)>>>,
-    ) {
-        (
-            Rc::clone(&self.published),
-            Rc::clone(&self.persisted),
-            Rc::clone(&self.guard_calls),
-        )
+    fn handles(&self) -> (PersistedPaths, GuardCalls) {
+        (Rc::clone(&self.persisted), Rc::clone(&self.guard_calls))
     }
 }
 
-impl RouterEventBus for RecBus {
-    fn publish_route_changed(&self, _cx: &mut App, path: SharedString) {
-        self.published.borrow_mut().push(path);
-    }
-
+impl RouterDelegate for RecDelegate {
     fn allow_navigate(
         &self,
         _cx: &mut App,
-        from: SharedString,
-        to: SharedString,
+        from: &SharedString,
+        to: &SharedString,
     ) -> Result<bool, SharedString> {
         self.guard_calls
             .borrow_mut()
-            .push((from, to.clone()));
-        if self.blocked_err.iter().any(|p| to.starts_with(p)) {
-            return Err(format!("守卫拒绝:{to}").into());
+            .push((from.clone(), to.clone()));
+        if self.blocked_err.iter().any(|prefix| to.starts_with(prefix)) {
+            return Err(format!("守卫拒绝：{to}").into());
         }
-        if self.blocked_silent.iter().any(|p| to.starts_with(p)) {
+        if self
+            .blocked_silent
+            .iter()
+            .any(|prefix| to.starts_with(prefix))
+        {
             return Ok(false);
         }
         Ok(true)
@@ -89,666 +68,665 @@ impl RouterEventBus for RecBus {
     }
 }
 
-fn paths(v: &RefCell<Vec<SharedString>>) -> Vec<String> {
-    v.borrow().iter().map(|p| p.to_string()).collect()
+fn paths(values: &RefCell<Vec<SharedString>>) -> Vec<String> {
+    values.borrow().iter().map(ToString::to_string).collect()
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// 1. 初始化与 navigate 基本行为
-// ════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_init_default_state() {
-    let cx = TestAppContext::single();
-    Router::init_default();
-    assert!(Router::is_enabled());
-    assert_eq!(Router::current().as_ref(), "/");
-    assert_eq!(Router::history_len(), 1);
-    assert_eq!(Router::cursor(), 0);
-    assert!(!Router::can_go_back());
-    assert!(!Router::can_go_forward());
-    drop(cx);
+fn new_router(cx: &mut App) -> Entity<Router> {
+    cx.new(|_| Router::new())
 }
 
-#[test]
-fn test_navigate_updates_current_history_and_fires_hooks() {
-    let cx = TestAppContext::single();
-    let bus = RecBus::new();
-    let (published, persisted, _) = bus.handles();
-    Router::init_with(bus);
+fn router_with_delegate<D: RouterDelegate>(cx: &mut App, delegate: D) -> Entity<Router> {
+    cx.new(|_| Router::with_delegate(delegate))
+}
 
+fn navigate(cx: &mut App, router: &Entity<Router>, path: &'static str) -> bool {
+    router.update(cx, |router, cx| router.navigate(cx, path))
+}
+
+fn navigate_force(cx: &mut App, router: &Entity<Router>, path: &'static str) -> bool {
+    router.update(cx, |router, cx| router.navigate_force(cx, path))
+}
+
+fn back(cx: &mut App, router: &Entity<Router>) -> bool {
+    router.update(cx, |router, cx| router.back(cx))
+}
+
+fn forward(cx: &mut App, router: &Entity<Router>) -> bool {
+    router.update(cx, |router, cx| router.forward(cx))
+}
+
+#[gpui_kit::test]
+fn default_state(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
     cx.update(|cx| {
-        assert!(Router::navigate(cx, "/files"));
-        assert!(Router::navigate(cx, "/search"));
+        let router = router.read(cx);
+        assert_eq!(router.current().as_ref(), "/");
+        assert_eq!(router.history_len(), 1);
+        assert_eq!(router.cursor(), 0);
+        assert!(!router.can_go_back());
+        assert!(!router.can_go_forward());
     });
+}
 
-    assert_eq!(Router::current().as_ref(), "/search");
-    assert_eq!(Router::history_len(), 3); // ["/", "/files", "/search"]
-    assert_eq!(Router::cursor(), 2);
-    assert!(Router::can_go_back());
-    assert!(!Router::can_go_forward());
-    // 每次 navigate 都应 publish + persist,且顺序一致。
-    assert_eq!(paths(&published), vec!["/files", "/search"]);
+#[gpui_kit::test]
+fn instances_are_independent(cx: &mut TestAppContext) {
+    let (first, second) = cx.update(|cx| (new_router(cx), new_router(cx)));
+    cx.update(|cx| {
+        navigate(cx, &first, "/files");
+        navigate(cx, &second, "/search");
+        assert_eq!(first.read(cx).current().as_ref(), "/files");
+        assert_eq!(second.read(cx).current().as_ref(), "/search");
+        assert_eq!(first.read(cx).history_len(), 2);
+        assert_eq!(second.read(cx).history_len(), 2);
+    });
+}
+
+#[gpui_kit::test]
+fn navigate_updates_state_and_persists(cx: &mut TestAppContext) {
+    let delegate = RecDelegate::new();
+    let (persisted, _) = delegate.handles();
+    let router = cx.update(|cx| router_with_delegate(cx, delegate));
+    cx.update(|cx| {
+        assert!(navigate(cx, &router, "/files"));
+        assert!(navigate(cx, &router, "/search"));
+        let state = router.read(cx);
+        assert_eq!(state.current().as_ref(), "/search");
+        assert_eq!(state.history_len(), 3);
+        assert_eq!(state.cursor(), 2);
+        assert!(state.can_go_back());
+        assert!(!state.can_go_forward());
+    });
     assert_eq!(paths(&persisted), vec!["/files", "/search"]);
 }
 
-#[test]
-fn test_navigate_same_path_no_duplicate_push() {
-    let cx = TestAppContext::single();
-    Router::init_default();
-
+#[gpui_kit::test]
+fn same_path_does_not_duplicate_history(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
     cx.update(|cx| {
-        assert!(Router::navigate(cx, "/files"));
-        assert!(Router::navigate(cx, "/files")); // 重复导航同路径
-    });
-
-    assert_eq!(Router::current().as_ref(), "/files");
-    // history 不重复 push(避免 back/forward 死循环)。
-    assert_eq!(Router::history_len(), 2);
-    assert_eq!(Router::cursor(), 1);
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// 2. back / forward 历史语义
-// ════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_back_forward_semantics() {
-    let cx = TestAppContext::single();
-    let bus = RecBus::new();
-    let (published, persisted, _) = bus.handles();
-    Router::init_with(bus);
-
-    cx.update(|cx| {
-        Router::navigate(cx, "/a");
-        Router::navigate(cx, "/b");
-        Router::navigate(cx, "/c");
-
-        assert_eq!(Router::current().as_ref(), "/c");
-        assert!(Router::back(cx));
-        assert_eq!(Router::current().as_ref(), "/b");
-        assert!(Router::back(cx));
-        assert_eq!(Router::current().as_ref(), "/a");
-        assert!(Router::can_go_forward());
-
-        assert!(Router::forward(cx));
-        assert_eq!(Router::current().as_ref(), "/b");
-    });
-
-    // back/forward 也走 publish + persist。
-    assert_eq!(
-        paths(&published),
-        vec!["/a", "/b", "/c", "/b", "/a", "/b"]
-    );
-    assert_eq!(paths(&persisted), published.borrow().clone());
-    // back/forward 不截断 history。
-    assert_eq!(Router::history_len(), 4);
-    assert_eq!(Router::cursor(), 2);
-}
-
-#[test]
-fn test_back_forward_boundaries() {
-    let cx = TestAppContext::single();
-    Router::init_default();
-
-    cx.update(|cx| {
-        // 初始只有 "/",不能 back / forward。
-        assert!(!Router::back(cx));
-        assert!(!Router::forward(cx));
-
-        Router::navigate(cx, "/a");
-        assert!(!Router::forward(cx)); // 在栈顶,不能 forward。
-        assert!(Router::back(cx));
-        assert!(!Router::back(cx)); // 到栈底,不能再 back。
-        assert_eq!(Router::current().as_ref(), "/");
-        assert_eq!(Router::cursor(), 0);
+        assert!(navigate(cx, &router, "/files"));
+        assert!(navigate(cx, &router, "/files"));
+        assert_eq!(router.read(cx).history_len(), 2);
+        assert_eq!(router.read(cx).cursor(), 1);
     });
 }
 
-#[test]
-fn test_navigate_after_back_truncates_forward_history() {
-    let cx = TestAppContext::single();
-    Router::init_default();
-
+#[gpui_kit::test]
+fn back_forward_semantics(cx: &mut TestAppContext) {
+    let delegate = RecDelegate::new();
+    let (persisted, _) = delegate.handles();
+    let router = cx.update(|cx| router_with_delegate(cx, delegate));
     cx.update(|cx| {
-        Router::navigate(cx, "/a");
-        Router::navigate(cx, "/b");
-        Router::back(cx); // 回到 /a,forward 栈里有 /b
-        Router::navigate(cx, "/c"); // 应截断 /b
+        navigate(cx, &router, "/a");
+        navigate(cx, &router, "/b");
+        navigate(cx, &router, "/c");
+        assert!(back(cx, &router));
+        assert_eq!(router.read(cx).current().as_ref(), "/b");
+        assert!(back(cx, &router));
+        assert_eq!(router.read(cx).current().as_ref(), "/a");
+        assert!(router.read(cx).can_go_forward());
+        assert!(forward(cx, &router));
+        assert_eq!(router.read(cx).current().as_ref(), "/b");
+        assert_eq!(router.read(cx).history_len(), 4);
+        assert_eq!(router.read(cx).cursor(), 2);
     });
-
-    assert_eq!(Router::current().as_ref(), "/c");
-    assert_eq!(Router::history_len(), 3); // ["/", "/a", "/c"]
-    assert_eq!(Router::cursor(), 2);
-    assert!(!Router::can_go_forward()); // /b 已被丢弃
+    assert_eq!(paths(&persisted), vec!["/a", "/b", "/c", "/b", "/a", "/b"]);
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// 3. 路由守卫(allow_navigate)
-// ════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_guard_rejects_with_err() {
-    let cx = TestAppContext::single();
-    let mut bus = RecBus::new();
-    bus.blocked_err = vec!["/admin"];
-    let (published, persisted, _) = bus.handles();
-    Router::init_with(bus);
-
+#[gpui_kit::test]
+fn back_forward_boundaries(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
     cx.update(|cx| {
-        // 被守卫拒绝:返回 false,一切状态不变。
-        assert!(!Router::navigate(cx, "/admin/panel"));
-        assert_eq!(Router::current().as_ref(), "/");
-        assert_eq!(Router::history_len(), 1);
-        assert!(published.borrow().is_empty());
+        assert!(!back(cx, &router));
+        assert!(!forward(cx, &router));
+        navigate(cx, &router, "/a");
+        assert!(!forward(cx, &router));
+        assert!(back(cx, &router));
+        assert!(!back(cx, &router));
+        assert_eq!(router.read(cx).current().as_ref(), "/");
+        assert_eq!(router.read(cx).cursor(), 0);
+    });
+}
+
+#[gpui_kit::test]
+fn navigate_after_back_truncates_forward_history(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
+    cx.update(|cx| {
+        navigate(cx, &router, "/a");
+        navigate(cx, &router, "/b");
+        back(cx, &router);
+        navigate(cx, &router, "/c");
+        let state = router.read(cx);
+        assert_eq!(state.current().as_ref(), "/c");
+        assert_eq!(state.history_len(), 3);
+        assert_eq!(state.cursor(), 2);
+        assert!(!state.can_go_forward());
+    });
+}
+
+#[gpui_kit::test]
+fn guard_rejects_with_reason(cx: &mut TestAppContext) {
+    let mut delegate = RecDelegate::new();
+    delegate.blocked_err = vec!["/admin"];
+    let (persisted, _) = delegate.handles();
+    let router = cx.update(|cx| router_with_delegate(cx, delegate));
+    cx.update(|cx| {
+        assert!(!navigate(cx, &router, "/admin/panel"));
+        assert_eq!(router.read(cx).current().as_ref(), "/");
+        assert_eq!(router.read(cx).history_len(), 1);
         assert!(persisted.borrow().is_empty());
-
-        // 其他路径不受影响。
-        assert!(Router::navigate(cx, "/files"));
-        assert_eq!(Router::current().as_ref(), "/files");
+        assert!(navigate(cx, &router, "/files"));
     });
 }
 
-#[test]
-fn test_guard_ok_false_silent_reject() {
-    let cx = TestAppContext::single();
-    let mut bus = RecBus::new();
-    bus.blocked_silent = vec!["/dirty"];
-    let (published, _, _) = bus.handles();
-    Router::init_with(bus);
-
+#[gpui_kit::test]
+fn guard_silently_rejects(cx: &mut TestAppContext) {
+    let mut delegate = RecDelegate::new();
+    delegate.blocked_silent = vec!["/dirty"];
+    let (persisted, _) = delegate.handles();
+    let router = cx.update(|cx| router_with_delegate(cx, delegate));
     cx.update(|cx| {
-        assert!(!Router::navigate(cx, "/dirty-page"));
-        assert_eq!(Router::current().as_ref(), "/");
-        assert!(published.borrow().is_empty());
+        assert!(!navigate(cx, &router, "/dirty-page"));
+        assert_eq!(router.read(cx).current().as_ref(), "/");
+    });
+    assert!(persisted.borrow().is_empty());
+}
+
+#[gpui_kit::test]
+fn force_navigation_bypasses_guard(cx: &mut TestAppContext) {
+    let mut delegate = RecDelegate::new();
+    delegate.blocked_err = vec!["/admin"];
+    let (persisted, guard_calls) = delegate.handles();
+    let router = cx.update(|cx| router_with_delegate(cx, delegate));
+    cx.update(|cx| {
+        assert!(navigate_force(cx, &router, "/admin/panel"));
+        assert_eq!(router.read(cx).current().as_ref(), "/admin/panel");
+    });
+    assert_eq!(paths(&persisted), vec!["/admin/panel"]);
+    assert!(guard_calls.borrow().is_empty());
+}
+
+#[gpui_kit::test]
+fn history_guard_and_force_variants(cx: &mut TestAppContext) {
+    let mut delegate = RecDelegate::new();
+    delegate.blocked_err = vec!["/a"];
+    let router = cx.update(|cx| router_with_delegate(cx, delegate));
+    cx.update(|cx| {
+        navigate_force(cx, &router, "/a");
+        navigate(cx, &router, "/b");
+        assert!(!back(cx, &router));
+        assert_eq!(router.read(cx).current().as_ref(), "/b");
+        assert!(router.update(cx, |router, cx| router.back_force(cx)));
+        assert_eq!(router.read(cx).current().as_ref(), "/a");
+        assert!(forward(cx, &router));
+        assert!(router.update(cx, |router, cx| router.back_force(cx)));
+        assert!(router.update(cx, |router, cx| router.forward_force(cx)));
+        assert_eq!(router.read(cx).current().as_ref(), "/b");
     });
 }
 
-#[test]
-fn test_navigate_force_bypasses_guard() {
-    let cx = TestAppContext::single();
-    let mut bus = RecBus::new();
-    bus.blocked_err = vec!["/admin"];
-    let (published, _, _) = bus.handles();
-    Router::init_with(bus);
-
+#[gpui_kit::test]
+fn guard_receives_current_and_target(cx: &mut TestAppContext) {
+    let delegate = RecDelegate::new();
+    let (_, guard_calls) = delegate.handles();
+    let router = cx.update(|cx| router_with_delegate(cx, delegate));
     cx.update(|cx| {
-        // force 跳过守卫(用户已在弹框确认的场景)。
-        assert!(Router::navigate_force(cx, "/admin/panel"));
-        assert_eq!(Router::current().as_ref(), "/admin/panel");
+        navigate(cx, &router, "/one");
+        navigate(cx, &router, "/two");
+        back(cx, &router);
     });
-    assert_eq!(paths(&published), vec!["/admin/panel"]);
-}
-
-#[test]
-fn test_back_forward_guard_and_force_variants() {
-    let cx = TestAppContext::single();
-    let mut bus = RecBus::new();
-    bus.blocked_err = vec!["/a"];
-    let (published, _, _) = bus.handles();
-    Router::init_with(bus);
-
-    cx.update(|cx| {
-        Router::navigate_force(cx, "/a"); // force 进去
-        Router::navigate(cx, "/b");
-        // back 目标是 /a → 被守卫拒绝。
-        assert!(!Router::back(cx));
-        assert_eq!(Router::current().as_ref(), "/b");
-        // back_force 跳过守卫。
-        assert!(Router::back_force(cx));
-        assert_eq!(Router::current().as_ref(), "/a");
-        // forward 目标是 /b(未被拦)→ 放行。
-        assert!(Router::forward(cx));
-        assert_eq!(Router::current().as_ref(), "/b");
-        // forward_force 同样可用。
-        assert!(Router::back_force(cx));
-        assert!(Router::forward_force(cx));
-        assert_eq!(Router::current().as_ref(), "/b");
-    });
-    // 被拒绝的 back 不产生 publish。
-    assert_eq!(paths(&published), vec!["/a", "/b", "/a", "/b", "/a", "/b"]);
-}
-
-#[test]
-fn test_guard_receives_correct_from_and_to() {
-    let cx = TestAppContext::single();
-    let bus = RecBus::new();
-    let (_, _, guard_calls) = bus.handles();
-    Router::init_with(bus);
-
-    cx.update(|cx| {
-        Router::navigate(cx, "/one");
-        Router::navigate(cx, "/two");
-        Router::back(cx);
-    });
-
     let calls: Vec<(String, String)> = guard_calls
         .borrow()
         .iter()
-        .map(|(f, t)| (f.to_string(), t.to_string()))
+        .map(|(from, to)| (from.to_string(), to.to_string()))
         .collect();
     assert_eq!(
         calls,
         vec![
             ("/".to_string(), "/one".to_string()),
             ("/one".to_string(), "/two".to_string()),
-            // back 的 to 取自 history[cursor-1]。
             ("/two".to_string(), "/one".to_string()),
         ]
     );
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// 4. 动态路由参数(matchit)
-// ════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_dynamic_params_extraction() {
-    let cx = TestAppContext::single();
-    Router::init_default();
-    Router::register("/user/{id}");
-
-    cx.update(|cx| Router::navigate(cx, "/user/123"));
-    let params = Router::params();
-    assert_eq!(params.get("id").map(|v| v.as_ref()), Some("123"));
-
-    // 换参数值,params 同步更新。
-    cx.update(|cx| Router::navigate(cx, "/user/abc"));
-    assert_eq!(
-        Router::params().get("id").map(|v| v.as_ref()),
-        Some("abc")
-    );
-}
-
-#[test]
-fn test_wildcard_params_extraction() {
-    let cx = TestAppContext::single();
-    Router::init_default();
-    Router::register("/files/{*path}");
-
-    cx.update(|cx| Router::navigate(cx, "/files/docs/rs/main.rs"));
-    assert_eq!(
-        Router::params().get("path").map(|v| v.as_ref()),
-        Some("docs/rs/main.rs")
-    );
-}
-
-#[test]
-fn test_params_cleared_when_path_not_matched() {
-    let cx = TestAppContext::single();
-    Router::init_default();
-    Router::register("/user/{id}");
-
+#[gpui_kit::test]
+fn dynamic_params_follow_navigation(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
     cx.update(|cx| {
-        Router::navigate(cx, "/user/123");
-        assert!(!Router::params().is_empty());
-        // 导航到不匹配任何模式的路径 → params 清空。
-        Router::navigate(cx, "/elsewhere");
-        assert!(Router::params().is_empty());
+        router.update(cx, |router, _| router.register("/user/{id}"));
+        navigate(cx, &router, "/user/123");
+        assert_eq!(
+            router.read(cx).params().get("id").map(|v| v.as_ref()),
+            Some("123")
+        );
+        navigate(cx, &router, "/user/abc");
+        assert_eq!(
+            router.read(cx).params().get("id").map(|v| v.as_ref()),
+            Some("abc")
+        );
     });
 }
 
-#[test]
-fn test_params_follow_back_forward() {
-    let cx = TestAppContext::single();
-    Router::init_default();
-    Router::register("/user/{id}");
-
+#[gpui_kit::test]
+fn wildcard_params_include_remaining_segments(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
     cx.update(|cx| {
-        Router::navigate(cx, "/user/1");
-        Router::navigate(cx, "/user/2");
-        Router::back(cx);
+        router.update(cx, |router, _| router.register("/files/{*path}"));
+        navigate(cx, &router, "/files/docs/rs/main.rs");
         assert_eq!(
-            Router::params().get("id").map(|v| v.as_ref()),
+            router.read(cx).params().get("path").map(|v| v.as_ref()),
+            Some("docs/rs/main.rs")
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn unmatched_path_clears_params(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
+    cx.update(|cx| {
+        router.update(cx, |router, _| router.register("/user/{id}"));
+        navigate(cx, &router, "/user/123");
+        navigate(cx, &router, "/elsewhere");
+        assert!(router.read(cx).params().is_empty());
+    });
+}
+
+#[gpui_kit::test]
+fn params_follow_back_and_forward(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
+    cx.update(|cx| {
+        router.update(cx, |router, _| router.register("/user/{id}"));
+        navigate(cx, &router, "/user/1");
+        navigate(cx, &router, "/user/2");
+        back(cx, &router);
+        assert_eq!(
+            router.read(cx).params().get("id").map(|v| v.as_ref()),
             Some("1")
         );
-        Router::forward(cx);
+        forward(cx, &router);
         assert_eq!(
-            Router::params().get("id").map(|v| v.as_ref()),
+            router.read(cx).params().get("id").map(|v| v.as_ref()),
             Some("2")
         );
     });
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// 5. is_active(matchit 语义 + 降级前缀匹配)
-// ════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_is_active_with_registered_patterns() {
-    let cx = TestAppContext::single();
-    Router::init_default();
-    Router::register("/files");
-    Router::register("/user/{id}");
-
-    cx.update(|cx| Router::navigate(cx, "/user/123"));
-    assert!(Router::is_active("/user/{id}")); // 动态段模式命中
-    assert!(!Router::is_active("/files"));
-
-    cx.update(|cx| Router::navigate(cx, "/files"));
-    assert!(Router::is_active("/files"));
-    assert!(!Router::is_active("/user/{id}"));
-}
-
-#[test]
-fn test_is_active_unregistered_falls_back_to_prefix() {
-    let cx = TestAppContext::single();
-    Router::init_default();
-    // /docs 未注册 → 降级 is_active_simple 前缀匹配。
-    cx.update(|cx| Router::navigate(cx, "/docs/guide/intro"));
-    assert!(Router::is_active("/docs"));
-    assert!(!Router::is_active("/docs-account")); // 段边界,不误判
-}
-
-#[test]
-fn test_register_dedup_then_navigate_works() {
-    let cx = TestAppContext::single();
-    Router::init_default();
-    Router::register("/files");
-    Router::register("/files"); // 重复注册应被去重(Trie 不冲突)
-
+#[gpui_kit::test]
+fn registering_new_pattern_invalidates_match_cache(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
     cx.update(|cx| {
-        assert!(Router::navigate(cx, "/files"));
-        assert!(Router::is_active("/files"));
+        router.update(cx, |router, _| router.register("/files"));
+        navigate(cx, &router, "/files");
+        assert!(router.read(cx).is_active("/files"));
+        router.update(cx, |router, _| router.register("/user/{id}"));
+        navigate(cx, &router, "/user/42");
+        assert!(router.read(cx).is_active("/user/{id}"));
+        assert_eq!(
+            router.read(cx).params().get("id").map(|v| v.as_ref()),
+            Some("42")
+        );
     });
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// 6. 持久化恢复(restore)
-// ════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_restore_from_persisted_path() {
-    let cx = TestAppContext::single();
-    let mut bus = RecBus::new();
-    bus.saved = Some("/user/42".into());
-    let (published, _, _) = bus.handles();
-    Router::init_with(bus);
-    Router::register("/user/{id}");
-
-    cx.update(|cx| Router::restore(cx));
-
-    assert_eq!(Router::current().as_ref(), "/user/42");
-    // params 照常填充。
-    assert_eq!(
-        Router::params().get("id").map(|v| v.as_ref()),
-        Some("42")
-    );
-    // history 重置为 [restored],重启后 back/forward 从恢复页重新开始。
-    assert_eq!(Router::history_len(), 1);
-    assert!(!Router::can_go_back());
-    assert!(!Router::can_go_forward());
-    // 静默恢复:不 publish。
-    assert!(published.borrow().is_empty());
-}
-
-#[test]
-fn test_restore_invalid_path_falls_back_to_root() {
-    let cx = TestAppContext::single();
-    let mut bus = RecBus::new();
-    bus.saved = Some("/deleted-page".into());
-    Router::init_with(bus);
-    Router::register("/files"); // patterns 非空 → 校验生效
-
-    cx.update(|cx| Router::restore(cx));
-    // 持久化路径在当前路由表无匹配 → 保持 "/"。
-    assert_eq!(Router::current().as_ref(), "/");
-    assert_eq!(Router::history_len(), 1);
-}
-
-#[test]
-fn test_restore_without_patterns_skips_validation() {
-    let cx = TestAppContext::single();
-    let mut bus = RecBus::new();
-    bus.saved = Some("/anything".into());
-    Router::init_with(bus);
-    // 不注册任何模式 → 无校验,直接恢复。
-
-    cx.update(|cx| Router::restore(cx));
-    assert_eq!(Router::current().as_ref(), "/anything");
-}
-
-#[test]
-fn test_restore_none_or_root_keeps_default() {
-    let cx = TestAppContext::single();
-    // 无持久化记录。
-    Router::init_with(RecBus::new());
-    cx.update(|cx| Router::restore(cx));
-    assert_eq!(Router::current().as_ref(), "/");
-
-    // 注:同一线程 Router 只能 init 一次,根路径场景由独立测试函数覆盖:
-    // (本函数只覆盖 None 场景;/ 场景语义等价于"无需恢复"。)
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// 7. Outlet 端到端渲染(经 VisualTestContext 拿 &mut Window + &mut App)
-// ════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_outlet_renders_registered_element() {
-    let mut cx = TestAppContext::single();
-    let calls: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
-
-    Router::init_default();
-    let calls_clone = Rc::clone(&calls);
-    Router::register_element("/files", move |_w, _cx| {
-        calls_clone.borrow_mut().push("files_element");
-        div().into_any_element()
-    });
-
+#[gpui_kit::test]
+fn active_uses_registered_pattern(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
     cx.update(|cx| {
-        Router::navigate(cx, "/files");
+        router.update(cx, |router, _| {
+            router.register("/files");
+            router.register("/user/{id}");
+        });
+        navigate(cx, &router, "/user/123");
+        assert!(router.read(cx).is_active("/user/{id}"));
+        assert!(!router.read(cx).is_active("/files"));
+        navigate(cx, &router, "/files");
+        assert!(router.read(cx).is_active("/files"));
+        assert!(!router.read(cx).is_active("/user/{id}"));
     });
-
-    let cx = cx.add_empty_window();
-    cx.update(|window, cx| {
-        // Outlet 是 RenderOnce:render 应调起当前路径的叶子工厂。
-        let _el = Outlet.render(window, cx);
-    });
-    assert_eq!(calls.borrow().as_slice(), &["files_element"]);
 }
 
-#[test]
-fn test_outlet_layout_wrapping_order_longest_first() {
-    let mut cx = TestAppContext::single();
-    let calls: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
-
-    Router::init_default();
-
-    let c = Rc::clone(&calls);
-    Router::register_element("/settings/profile", move |_w, _cx| {
-        c.borrow_mut().push("element");
-        div().into_any_element()
-    });
-    let c = Rc::clone(&calls);
-    Router::register_layout("/", move |outlet| {
-        c.borrow_mut().push("layout_root");
-        div().child(outlet).into_any_element()
-    });
-    let c = Rc::clone(&calls);
-    Router::register_layout("/settings", move |outlet| {
-        c.borrow_mut().push("layout_settings");
-        div().child(outlet).into_any_element()
-    });
-    // 与当前路径无关的 layout 不应参与包裹。
-    let c = Rc::clone(&calls);
-    Router::register_layout("/unrelated", move |outlet| {
-        c.borrow_mut().push("layout_unrelated");
-        outlet
-    });
-
+#[gpui_kit::test]
+fn active_unregistered_target_uses_segment_prefix(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
     cx.update(|cx| {
-        Router::navigate(cx, "/settings/profile");
+        navigate(cx, &router, "/docs/guide/intro");
+        assert!(router.read(cx).is_active("/docs"));
+        assert!(!router.read(cx).is_active("/docs-account"));
     });
+}
 
-    let cx = cx.add_empty_window();
-    cx.update(|window, cx| {
-        let _el = Outlet.render(window, cx);
+#[gpui_kit::test]
+fn duplicate_registration_is_harmless(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
+    cx.update(|cx| {
+        router.update(cx, |router, _| {
+            router.register("/files");
+            router.register("/files");
+        });
+        assert!(navigate(cx, &router, "/files"));
+        assert!(router.read(cx).is_active("/files"));
     });
+}
 
-    // 由内向外:element → /settings(具体,内层)→ /(根,外层);/unrelated 不参与。
+#[gpui_kit::test]
+fn restore_valid_path_resets_history_without_persisting(cx: &mut TestAppContext) {
+    let mut delegate = RecDelegate::new();
+    delegate.saved = Some("/user/42".into());
+    let (persisted, guard_calls) = delegate.handles();
+    let router = cx.update(|cx| router_with_delegate(cx, delegate));
+    cx.update(|cx| {
+        router.update(cx, |router, _| router.register("/user/{id}"));
+        assert!(router.update(cx, |router, cx| router.restore(cx)));
+        let state = router.read(cx);
+        assert_eq!(state.current().as_ref(), "/user/42");
+        assert_eq!(state.params().get("id").map(|v| v.as_ref()), Some("42"));
+        assert_eq!(state.history_len(), 1);
+        assert!(!state.can_go_back());
+        assert!(!state.can_go_forward());
+    });
+    assert!(persisted.borrow().is_empty());
+    assert!(guard_calls.borrow().is_empty());
+}
+
+#[gpui_kit::test]
+fn restore_invalid_path_falls_back_to_root(cx: &mut TestAppContext) {
+    let mut delegate = RecDelegate::new();
+    delegate.saved = Some("/deleted-page".into());
+    let router = cx.update(|cx| router_with_delegate(cx, delegate));
+    cx.update(|cx| {
+        router.update(cx, |router, _| router.register("/files"));
+        assert!(!router.update(cx, |router, cx| router.restore(cx)));
+        assert_eq!(router.read(cx).current().as_ref(), "/");
+        assert_eq!(router.read(cx).history_len(), 1);
+    });
+}
+
+#[gpui_kit::test]
+fn restore_without_patterns_accepts_saved_path(cx: &mut TestAppContext) {
+    let mut delegate = RecDelegate::new();
+    delegate.saved = Some("/anything".into());
+    let router = cx.update(|cx| router_with_delegate(cx, delegate));
+    cx.update(|cx| {
+        assert!(router.update(cx, |router, cx| router.restore(cx)));
+        assert_eq!(router.read(cx).current().as_ref(), "/anything");
+    });
+}
+
+#[gpui_kit::test]
+fn restore_without_record_keeps_default(cx: &mut TestAppContext) {
+    let router = cx.update(|cx| router_with_delegate(cx, RecDelegate::new()));
+    cx.update(|cx| {
+        assert!(!router.update(cx, |router, cx| router.restore(cx)));
+        assert_eq!(router.read(cx).current().as_ref(), "/");
+    });
+}
+
+#[gpui_kit::test]
+fn restore_root_keeps_default(cx: &mut TestAppContext) {
+    let mut delegate = RecDelegate::new();
+    delegate.saved = Some("/".into());
+    let router = cx.update(|cx| router_with_delegate(cx, delegate));
+    cx.update(|cx| {
+        assert!(!router.update(cx, |router, cx| router.restore(cx)));
+        assert_eq!(router.read(cx).current().as_ref(), "/");
+        assert_eq!(router.read(cx).history_len(), 1);
+    });
+}
+
+#[gpui_kit::test]
+fn persistence_is_synchronous_and_route_event_is_delivered(cx: &mut TestAppContext) {
+    struct OrderDelegate {
+        calls: Rc<RefCell<Vec<String>>>,
+    }
+    impl RouterDelegate for OrderDelegate {
+        fn persist_pathname(&self, _cx: &mut App, path: &SharedString) {
+            self.calls.borrow_mut().push(format!("persist:{path}"));
+        }
+    }
+
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let router = cx.update(|cx| {
+        router_with_delegate(
+            cx,
+            OrderDelegate {
+                calls: Rc::clone(&calls),
+            },
+        )
+    });
+    let event_calls = Rc::clone(&calls);
+    let _subscriber = cx.update(|cx| {
+        cx.new(|cx| {
+            cx.subscribe(&router, move |_, _, event: &RouteChanged, _| {
+                event_calls
+                    .borrow_mut()
+                    .push(format!("event:{}", event.pathname()));
+            })
+            .detach();
+        })
+    });
+    cx.update(|cx| {
+        navigate(cx, &router, "/files");
+        assert_eq!(calls.borrow().as_slice(), &["persist:/files"]);
+    });
     assert_eq!(
         calls.borrow().as_slice(),
-        &["element", "layout_settings", "layout_root"]
+        &["persist:/files", "event:/files"]
     );
 }
 
-#[test]
-fn test_outlet_no_match_renders_empty_gracefully() {
-    let mut cx = TestAppContext::single();
-    Router::init_default();
-    cx.update(|cx| {
-        Router::navigate(cx, "/nothing-registered");
+#[gpui_kit::test]
+fn restore_emits_route_event(cx: &mut TestAppContext) {
+    let mut delegate = RecDelegate::new();
+    delegate.saved = Some("/files".into());
+    let (persisted, _) = delegate.handles();
+    let router = cx.update(|cx| router_with_delegate(cx, delegate));
+    let restored = Rc::new(RefCell::new(Vec::new()));
+    let restored_in_event = Rc::clone(&restored);
+    let _subscriber = cx.update(|cx| {
+        cx.new(|cx| {
+            cx.subscribe(&router, move |_, _, event: &RouteChanged, _| {
+                restored_in_event
+                    .borrow_mut()
+                    .push(event.pathname().to_string());
+            })
+            .detach();
+        })
     });
-    let cx = cx.add_empty_window();
-    cx.update(|window, cx| {
-        // 无 element 匹配 → Empty,不 panic。
-        let _el = Outlet.render(window, cx);
+    cx.update(|cx| {
+        assert!(router.update(cx, |router, cx| router.restore(cx)));
+    });
+    assert_eq!(restored.borrow().as_slice(), &["/files"]);
+    assert!(persisted.borrow().is_empty());
+}
+
+#[gpui_kit::test]
+fn outlet_renders_registered_element(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let calls_in_factory = Rc::clone(&calls);
+    cx.update(|cx| {
+        router.update(cx, |router, _| {
+            router.register_element("/files", move |_, _, _| {
+                calls_in_factory.borrow_mut().push("files");
+                div().into_any_element()
+            });
+        });
+        navigate(cx, &router, "/files");
+    });
+    let window = cx.add_empty_window();
+    window.update(|window, cx| {
+        drop(Outlet::new(&router).render(window, cx));
+    });
+    assert_eq!(calls.borrow().as_slice(), &["files"]);
+}
+
+#[gpui_kit::test]
+fn outlet_wraps_layouts_from_specific_to_root(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let element_calls = Rc::clone(&calls);
+    let root_calls = Rc::clone(&calls);
+    let settings_calls = Rc::clone(&calls);
+    cx.update(|cx| {
+        router.update(cx, |router, _| {
+            router.register_element("/settings/profile", move |_, _, _| {
+                element_calls.borrow_mut().push("element");
+                div().into_any_element()
+            });
+            router.register_layout("/", move |outlet| {
+                root_calls.borrow_mut().push("root");
+                div().child(outlet).into_any_element()
+            });
+            router.register_layout("/settings", move |outlet| {
+                settings_calls.borrow_mut().push("settings");
+                div().child(outlet).into_any_element()
+            });
+            router.register_layout("/unrelated", |outlet| outlet);
+        });
+        navigate(cx, &router, "/settings/profile");
+    });
+    let window = cx.add_empty_window();
+    window.update(|window, cx| {
+        drop(Outlet::new(&router).render(window, cx));
+    });
+    assert_eq!(calls.borrow().as_slice(), &["element", "settings", "root"]);
+}
+
+#[gpui_kit::test]
+fn outlet_without_match_renders_empty(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
+    cx.update(|cx| navigate(cx, &router, "/nothing-registered"));
+    let window = cx.add_empty_window();
+    window.update(|window, cx| {
+        drop(Outlet::new(&router).render(window, cx));
     });
 }
 
-#[test]
-fn test_outlet_without_router_enabled_renders_empty() {
-    // 本测试线程不调用 init_*(Router 未启用)→ Outlet 优雅降级为 Empty。
-    let mut cx = TestAppContext::single();
-    let cx = cx.add_empty_window();
-    cx.update(|window, cx| {
-        let _el = Outlet.render(window, cx);
-    });
-    assert!(!Router::is_enabled());
-}
-
-#[test]
-fn test_register_same_path_overrides_factory() {
-    let mut cx = TestAppContext::single();
-    let calls: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
-
-    Router::init_default();
-    let c = Rc::clone(&calls);
-    Router::register_element("/files", move |_w, _cx| {
-        c.borrow_mut().push("old");
-        div().into_any_element()
-    });
-    let c = Rc::clone(&calls);
-    // 同路径重复注册:覆盖旧工厂(而非并存两个)。
-    Router::register_element("/files", move |_w, _cx| {
-        c.borrow_mut().push("new");
-        div().into_any_element()
-    });
-
+#[gpui_kit::test]
+fn registering_same_element_replaces_factory(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let old_calls = Rc::clone(&calls);
+    let new_calls = Rc::clone(&calls);
     cx.update(|cx| {
-        Router::navigate(cx, "/files");
+        router.update(cx, |router, _| {
+            router.register_element("/files", move |_, _, _| {
+                old_calls.borrow_mut().push("old");
+                div().into_any_element()
+            });
+            router.register_element("/files", move |_, _, _| {
+                new_calls.borrow_mut().push("new");
+                div().into_any_element()
+            });
+        });
+        navigate(cx, &router, "/files");
     });
-    let cx = cx.add_empty_window();
-    cx.update(|window, cx| {
-        let _el = Outlet.render(window, cx);
+    let window = cx.add_empty_window();
+    window.update(|window, cx| {
+        drop(Outlet::new(&router).render(window, cx));
     });
     assert_eq!(calls.borrow().as_slice(), &["new"]);
 }
 
-/// 动态模式叶子(0.2 起):register_element("/user/{id}") 一条覆盖所有 /user/*。
-#[test]
-fn test_outlet_dynamic_element_pattern() {
-    let mut cx = TestAppContext::single();
-    let calls: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
-
-    Router::init_default();
-    let c = Rc::clone(&calls);
-    Router::register_element("/user/{id}", move |_w, _cx| {
-        c.borrow_mut().push("user_panel");
-        div().into_any_element()
-    });
-
+#[gpui_kit::test]
+fn outlet_dynamic_element_supplies_route_snapshot(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
+    let seen = Rc::new(RefCell::new(None));
     cx.update(|cx| {
-        Router::navigate(cx, "/user/42");
+        let seen = Rc::clone(&seen);
+        router.update(cx, |router, _| {
+            router.register_element("/user/{id}", move |route, _, _| {
+                *seen.borrow_mut() = route.param("id").map(ToString::to_string);
+                div().into_any_element()
+            });
+        });
+        navigate(cx, &router, "/user/42");
     });
-    // 隐含 register:params 自动填充,无需另行 Router::register。
-    assert_eq!(
-        Router::params().get("id").map(|v| v.as_ref()),
-        Some("42")
-    );
-    // is_active 用模式判定同样生效。
-    assert!(Router::is_active("/user/{id}"));
-
-    let cx = cx.add_empty_window();
-    cx.update(|window, cx| {
-        let _el = Outlet.render(window, cx);
+    let window = cx.add_empty_window();
+    window.update(|window, cx| {
+        drop(Outlet::new(&router).render(window, cx));
     });
-    assert_eq!(calls.borrow().as_slice(), &["user_panel"]);
+    assert_eq!(seen.borrow().as_deref(), Some("42"));
 }
 
-/// 静态模式优先于动态模式(matchit 内建优先级)。
-#[test]
-fn test_outlet_static_beats_dynamic() {
-    let mut cx = TestAppContext::single();
-    let calls: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
-
-    Router::init_default();
-    let c = Rc::clone(&calls);
-    Router::register_element("/user/{id}", move |_w, _cx| {
-        c.borrow_mut().push("dynamic");
-        div().into_any_element()
-    });
-    let c = Rc::clone(&calls);
-    Router::register_element("/user/new", move |_w, _cx| {
-        c.borrow_mut().push("static");
-        div().into_any_element()
-    });
-
+#[gpui_kit::test]
+fn new_static_element_invalidates_dynamic_match_cache(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let dynamic_calls = Rc::clone(&calls);
     cx.update(|cx| {
-        Router::navigate(cx, "/user/new"); // 应命中静态,不是 {id}
+        router.update(cx, |router, _| {
+            router.register_element("/user/{id}", move |_, _, _| {
+                dynamic_calls.borrow_mut().push("dynamic");
+                div().into_any_element()
+            });
+        });
+        navigate(cx, &router, "/user/42");
     });
-    let cx = cx.add_empty_window();
-    cx.update(|window, cx| {
-        let _el = Outlet.render(window, cx);
+    let window = cx.add_empty_window();
+    window.update(|window, cx| {
+        drop(Outlet::new(&router).render(window, cx));
+        let static_calls = Rc::clone(&calls);
+        router.update(cx, |router, _| {
+            router.register_element("/user/new", move |_, _, _| {
+                static_calls.borrow_mut().push("static");
+                div().into_any_element()
+            });
+        });
+        navigate(cx, &router, "/user/new");
+        drop(Outlet::new(&router).render(window, cx));
     });
-    assert_eq!(calls.borrow().as_slice(), &["static"]);
-
-    // 其他 id 仍走动态模式。
-    cx.update(|_window, cx| {
-        Router::navigate(cx, "/user/42");
-    });
-    cx.update(|window, cx| {
-        let _el = Outlet.render(window, cx);
-    });
-    assert_eq!(calls.borrow().as_slice(), &["static", "dynamic"]);
+    assert_eq!(calls.borrow().as_slice(), &["dynamic", "static"]);
 }
 
-/// 通配模式叶子:/docs/{*path} 匹配多级路径。
-#[test]
-fn test_outlet_wildcard_element_pattern() {
-    let mut cx = TestAppContext::single();
-    let calls: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
-
-    Router::init_default();
-    let c = Rc::clone(&calls);
-    Router::register_element("/docs/{*path}", move |_w, _cx| {
-        c.borrow_mut().push("docs_panel");
-        div().into_any_element()
-    });
-
+#[gpui_kit::test]
+fn outlet_wildcard_element_matches_nested_path(cx: &mut TestAppContext) {
+    let router = cx.update(new_router);
+    let seen = Rc::new(RefCell::new(None));
     cx.update(|cx| {
-        Router::navigate(cx, "/docs/guide/intro");
+        let seen = Rc::clone(&seen);
+        router.update(cx, |router, _| {
+            router.register_element("/docs/{*path}", move |route, _, _| {
+                *seen.borrow_mut() = route.param("path").map(ToString::to_string);
+                div().into_any_element()
+            });
+        });
+        navigate(cx, &router, "/docs/guide/intro");
     });
-    assert_eq!(
-        Router::params().get("path").map(|v| v.as_ref()),
-        Some("guide/intro")
-    );
-
-    let cx = cx.add_empty_window();
-    cx.update(|window, cx| {
-        let _el = Outlet.render(window, cx);
+    let window = cx.add_empty_window();
+    window.update(|window, cx| {
+        drop(Outlet::new(&router).render(window, cx));
     });
-    assert_eq!(calls.borrow().as_slice(), &["docs_panel"]);
+    assert_eq!(seen.borrow().as_deref(), Some("guide/intro"));
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// 8. 响应式通知链路说明
-// ════════════════════════════════════════════════════════════════════════
-//
-// Router 的 pathname 用 RwSignal 承载,但其「变化通知」的公开契约是
-// RouterEventBus::publish_route_changed(由使用方转发到 gpui observe / 自有
-// EventBus,上面 §1–§3 已完整覆盖),而非 reactive_graph Effect——
-// Effect 需要 effects feature + any_spawner,Router 本体不依赖它。
-// 因此信号读路径的实时性由「navigate 后 Router::current() 立即反映新值」
-// 的各断言覆盖(见 §1–§6),不再单独测 reactive_graph 内部机制。
+#[gpui_kit::test]
+fn outlets_use_their_own_router_instances(cx: &mut TestAppContext) {
+    let (first, second) = cx.update(|cx| (new_router(cx), new_router(cx)));
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let first_calls = Rc::clone(&calls);
+    let second_calls = Rc::clone(&calls);
+    cx.update(|cx| {
+        first.update(cx, |router, _| {
+            router.register_element("/first", move |_, _, _| {
+                first_calls.borrow_mut().push("first");
+                div().into_any_element()
+            });
+        });
+        second.update(cx, |router, _| {
+            router.register_element("/second", move |_, _, _| {
+                second_calls.borrow_mut().push("second");
+                div().into_any_element()
+            });
+        });
+        navigate(cx, &first, "/first");
+        navigate(cx, &second, "/second");
+    });
+    let window = cx.add_empty_window();
+    window.update(|window, cx| {
+        drop(Outlet::new(&first).render(window, cx));
+        drop(Outlet::new(&second).render(window, cx));
+    });
+    assert_eq!(calls.borrow().as_slice(), &["first", "second"]);
+}

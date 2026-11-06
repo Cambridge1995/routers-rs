@@ -5,6 +5,23 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/),
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.0] - 2026-11-06
+
+### 变更
+
+- 路由状态改为应用显式持有的 `Entity<Router>`，移除线程局部全局单例和 `reactive_graph` 状态副本
+- GPUI 类型统一由 `gpui-kit 0.9.0` 提供，移除对旧版 `gpui 0.2.2` 的直接依赖
+- `RouterEventBus` 拆分为守卫与持久化委托 `RouterDelegate`，通知改用原生 `RouteChanged` 事件和实体观察
+- `Outlet::new(&router)` 显式绑定路由实例；页面工厂接收包含路径与参数的 `Route` 快照
+- 成功恢复现在发出路由事件与实体通知，但仍跳过守卫和重复持久化
+- 示例迁移到 GPUI Kit 组件与语义主题令牌
+
+### 修复与验证
+
+- 覆盖多个路由实例、事件投递、同步持久化、恢复、缓存失效及 Outlet 集成行为
+- 文档中的依赖版本、调用方式、恢复语义和验证命令与实现同步
+- 移除未经实测的匹配复杂度和动态分发性能数字
+
 ## [0.1.1] - 2026-07-26
 
 ### 新增
@@ -24,7 +41,7 @@
 - **核心**:`Router`(thread-local 全局单例),`RwSignal<SharedString>` 承载 pathname 作单一事实来源(基于 `reactive_graph`)
 - **导航**:`navigate` / `navigate_force`,返回值标识是否被守卫拦截
 - **历史栈**:`back` / `forward` / `back_force` / `forward_force` / `can_go_back` / `can_go_forward` / `history_len` / `cursor`,浏览器标准语义(back 后 navigate 截断 forward 历史,同路径不重复入栈)
-- **动态路由**:`register` 注册模式,支持静态段 / 动态段 `{id}` / 通配段 `{*splat}`(matchit Trie,O(1) 匹配 + Trie 缓存,注册时自动失效重建)
+- **动态路由**:`register` 注册模式,支持静态段 / 动态段 `{id}` / 通配段 `{*splat}`(matchit Trie + 缓存,注册时自动失效重建)
 - **参数提取**:`params()`,navigate / back / forward / restore 时自动填充
 - **路由守卫**:`RouterEventBus::allow_navigate` 三态语义(`Ok(true)` 放行 / `Ok(false)` 静默取消 / `Err(msg)` 带错误取消),覆盖 navigate / back / forward
 - **持久化**:`persist_pathname` / `restore_pathname` trait 钩子 + `Router::restore()` 静默恢复(不发布事件、不走守卫、history 重置;恢复路径经路由表校验,失效回退 `/`)
@@ -34,7 +51,7 @@
 - **active 判定**:`Router::is_active`(matchit 精确语义)+ `is_active_simple`(前缀/精确,NavLink 语义,含段边界保护)
 - **re-export**:`routers::gpui` / `routers::reactive_graph`,使用方只依赖本 crate
 - **示例**:`examples/router_demo.rs`,一个窗口演示全部能力(导航高亮 / 动态参数 / back-forward / 嵌套布局 / 守卫拦截与强制进入 / 持久化恢复)
-- **测试**:39 个测试——12 个纯函数单测 + 27 个基于 gpui `TestAppContext` 的端到端集成测试
+- **测试**:纯函数测试与基于 gpui `TestAppContext` 的端到端集成测试
 - **文档**:README(功能对比 / 依赖 / 安装 / 八节使用教程 / 守卫禁忌 / 异步持久化配方)
 
 [0.1.0]: https://github.com/Cambridge1995/routers-rs/releases/tag/v0.1.0
